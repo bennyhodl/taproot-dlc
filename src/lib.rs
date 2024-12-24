@@ -23,7 +23,7 @@ use kormir::{OracleAnnouncement, OracleAttestation};
 use rand::Rng;
 use rand::{rngs::ThreadRng, thread_rng};
 use schnorr_fun::adaptor::{Adaptor, EncryptedSign};
-use schnorr_fun::fun::marker::{NonZero, Normal, Secret};
+use schnorr_fun::fun::marker::{NonZero, Normal, Public, Secret};
 use schnorr_fun::Message;
 use schnorr_fun::{
     adaptor::EncryptedSignature,
@@ -51,6 +51,8 @@ pub enum TaprootDlcError {
     General(String),
     #[error("Esplora skill issue.")]
     Esplora,
+    #[error("Oracle error")]
+    Oracle,
 }
 
 pub struct DlcParty {
@@ -59,6 +61,7 @@ pub struct DlcParty {
     funding_keypair: KeyPair<EvenY>,
     payout_keypair: KeyPair<EvenY>,
     wallet: TaprootWallet,
+    is_offerer: bool,
 }
 
 #[derive(Debug)]
@@ -103,7 +106,7 @@ pub struct DlcSign {
 }
 
 impl DlcParty {
-    pub fn new(wallet: TaprootWallet) -> Self {
+    pub fn new(wallet: TaprootWallet, is_offerer: bool) -> Self {
         let secp = Secp256k1::new();
         // Create Schnorr context with synthetic nonces
         let nonce_gen = Synthetic::<Sha256, GlobalRng<ThreadRng>>::default();
@@ -118,6 +121,7 @@ impl DlcParty {
             funding_keypair,
             payout_keypair,
             wallet,
+            is_offerer,
         }
     }
 
@@ -181,7 +185,7 @@ impl DlcParty {
         let cet_adaptor_signatures = self.create_cet_adaptor_signatures(
             &offer.contract_info.contract_descriptor,
             &offer.contract_info.oracle_announcements[0],
-            self.payout_keypair.public_key(),
+            offer.offer_params.payout_script_pubkey,
             offer.total_collateral,
         );
 
@@ -238,7 +242,7 @@ impl DlcParty {
         let cet_adaptor_signatures = self.create_cet_adaptor_signatures(
             &accept.offer.contract_info.contract_descriptor,
             &accept.offer.contract_info.oracle_announcements[0],
-            self.payout_keypair.public_key(),
+            accept.accept_params.payout_script_pubkey,
             accept.offer.total_collateral,
         );
 
@@ -265,16 +269,23 @@ impl DlcParty {
                 .iter()
                 .enumerate()
                 .map(|(i, outcome)| {
-                    let cet = self.build_cet(&outcome, counterparty_pubkey, total_collateral);
+                    if counterparty_pubkey.to_bytes() == self.payout_keypair.public_key().to_bytes()
+                    {
+                        panic!("Counterparty pubkey is same as self pubkey!");
+                    }
+                    let cet = self
+                        .build_cet(&outcome, counterparty_pubkey, total_collateral)
+                        .serialize()
+                        .unwrap();
 
                     let nonce = announcement.oracle_event.oracle_nonces[i].clone();
                     let oracle_point = convert_xonly_to_normal_point(&nonce);
 
-                    let encrypted_signature = self.context.encrypted_sign(
-                        &self.payout_keypair,
-                        &oracle_point,
-                        Message::<Secret>::plain("cet", &cet.serialize().unwrap()),
-                    );
+                    let message = Message::<Secret>::plain("cet", &cet);
+
+                    let encrypted_signature =
+                        self.context
+                            .encrypted_sign(&self.payout_keypair, &oracle_point, message);
 
                     encrypted_signature
                 })
@@ -296,28 +307,36 @@ impl DlcParty {
         let input = vec![];
         let mut output = vec![];
 
-        if outcome.payout.accept > 0 {
-            output.push(TxOut {
-                script_pubkey: point_to_p2tr_script(&self.payout_keypair.public_key()),
-                value: Amount::from_sat(outcome.payout.accept),
-            });
-        }
+        let (offer_pubkey, accept_pubkey) = if self.is_offerer {
+            (self.payout_keypair.public_key(), counterparty_pubkey)
+        } else {
+            (counterparty_pubkey, self.payout_keypair.public_key())
+        };
 
         if outcome.payout.offer > 0 {
             output.push(TxOut {
-                script_pubkey: point_to_p2tr_script(&counterparty_pubkey),
+                script_pubkey: point_to_p2tr_script(&offer_pubkey, &self.secp),
                 value: Amount::from_sat(outcome.payout.offer),
+            });
+        }
+
+        if outcome.payout.accept > 0 {
+            output.push(TxOut {
+                script_pubkey: point_to_p2tr_script(&accept_pubkey, &self.secp),
+                value: Amount::from_sat(outcome.payout.accept),
             });
         }
 
         // Make sure the total collateral matches the outputs
 
-        Transaction {
+        let tx = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input,
             output,
-        }
+        };
+
+        tx
     }
 
     fn verify_adaptor_signatures(
@@ -332,16 +351,19 @@ impl DlcParty {
             ContractDescriptor::Enum(e) => e.outcome_payouts.as_slice(),
             ContractDescriptor::Numerical(_) => return Err(TaprootDlcError::NumericContract),
         };
-        println!("Verifying payouts: {:?}", payouts);
         for (i, signature) in sigs.iter().enumerate() {
             let nonce = announcement.oracle_event.oracle_nonces[i].clone();
             let oracle_point = convert_xonly_to_normal_point(&nonce);
 
-            let cet = self.build_cet(&payouts[i], counterparty_pubkey, total_collateral);
+            let cet = self
+                .build_cet(&payouts[i], counterparty_pubkey, total_collateral)
+                .serialize()
+                .unwrap();
+            let message = Message::<Secret>::plain("cet", &cet);
             if !self.context.verify_encrypted_signature(
                 &counterparty_pubkey,
                 &oracle_point,
-                Message::<Secret>::plain("cet", &cet.serialize().unwrap()),
+                message,
                 signature,
             ) {
                 return Err(TaprootDlcError::InvalidAdaptorSignature);
@@ -428,15 +450,6 @@ impl DlcParty {
         encrypted_signature: EncryptedSignature,
         sign_dlc: DlcSign,
     ) -> Result<Transaction, TaprootDlcError> {
-        let txin = TxIn {
-            pe
-        }
-        Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![funding_transaction],
-            output: vec![],
-        };
         let my_sig = self
             .context
             .decrypt_signature(oracle_signature.s.non_zero().unwrap(), encrypted_signature);
@@ -484,26 +497,21 @@ fn point_to_pubkey(point: Point<EvenY>) -> Result<PublicKey, TaprootDlcError> {
     Ok(pubkey)
 }
 
-fn convert_xonly_to_normal_point(x_only_pk: &XOnlyPublicKey) -> Point<Normal, Secret, NonZero> {
+fn convert_xonly_to_normal_point(x_only_pk: &XOnlyPublicKey) -> Point<Normal, Public, NonZero> {
     let xonly_bytess = x_only_pk.serialize();
-    let oracle_point: Point<EvenY, Secret, NonZero> =
+    let oracle_point: Point<EvenY, Public, NonZero> =
         Point::from_xonly_bytes(xonly_bytess).unwrap();
-    oracle_point.normalize().secret()
+    oracle_point.normalize()
 }
 
-fn point_to_p2tr_script(point: &Point<EvenY>) -> ScriptBuf {
+fn point_to_p2tr_script(point: &Point<EvenY>, secp: &Secp256k1<All>) -> ScriptBuf {
     // Get x-only pubkey bytes
     let xonly_bytes = point.to_xonly_bytes();
 
-    // Create witness program (this is how P2TR addresses are constructed)
-    let witness_program = WitnessProgram::new(
-        WitnessVersion::V1, // Taproot uses version 1
-        &xonly_bytes[..],   // x-only pubkey bytes
-    )
-    .expect("Valid 32-byte public key");
+    // Convert to XOnlyPublicKey first to ensure consistent encoding
+    let xonly_pubkey = XOnlyPublicKey::from_slice(&xonly_bytes).expect("Valid x-only pubkey");
 
-    // Convert to ScriptBuf
-    ScriptBuf::new_witness_program(&witness_program)
+    ScriptBuf::new_p2tr(secp, xonly_pubkey, None)
 }
 
 #[cfg(test)]
@@ -594,8 +602,8 @@ mod tests {
     fn taproot_dlc() {
         let alice_wallet = TaprootWallet::wallet();
         let bob_wallet = TaprootWallet::wallet();
-        let alice = DlcParty::new(alice_wallet);
-        let bob = DlcParty::new(bob_wallet);
+        let alice = DlcParty::new(alice_wallet, true);
+        let bob = DlcParty::new(bob_wallet, false);
 
         let offer_collateral = Amount::ONE_BTC;
         let total_collateral = Amount::ONE_BTC + Amount::ONE_BTC;
@@ -614,10 +622,7 @@ mod tests {
             )
             .unwrap();
 
-        println!("{:?}", offer);
-
         let accept = bob.accept_dlc(offer).unwrap();
-        println!("{:?}", accept);
 
         let _ = alice.sign_dlc(accept).unwrap();
     }
