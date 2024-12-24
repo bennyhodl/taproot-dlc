@@ -1,0 +1,17 @@
+{
+  "announcementSignature": "c470ce8cd6573b6c88cb9ee0223f609e147d34ac3ed943f68d44a1103a6dae89a03463fe0264bf2572839dc20f1b3cb23d4f2f3a0f5af69d341fca52e60b8b20",
+  "oraclePublicKey": "70b3c06d08b9547295dead92994faeef8a6ea6144344a18008885ce2d1466576",
+  "oracleEvent": {
+    "oracleNonces": [
+      "f5fd7cd57bcc563c1bef3f9a1ed11d8f9d6164834c3eace348a15b7b56cd353d",
+      "6499ddd1bf6cb1fc4bbc5c8468e5189af00dea9c8671f212caef60d44d5e6b4f"
+    ],
+    "eventMaturityEpoch": 1734621263,
+    "eventDescriptor": {
+      "enumEvent": {
+        "outcomes": ["OP_CAT", "OP_CTV"]
+      }
+    },
+    "eventId": "taproot-dlc"
+  }
+}
