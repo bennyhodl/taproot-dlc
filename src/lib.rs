@@ -2,7 +2,18 @@
 mod oracle;
 mod wallet;
 
-use bitcoin::taproot::{ControlBlock, TaprootMerkleBranch};
+use bitcoin::{
+    absolute::LockTime,
+    hashes::Hash,
+    opcodes::all::OP_CHECKMULTISIG,
+    script::Builder,
+    sighash::{Prevouts, SighashCache},
+    taproot::{ControlBlock, LeafVersion, TapTree, TaprootBuilder, TaprootMerkleBranch},
+    transaction::Version,
+    Address, Amount, FeeRate, PublicKey, Script, ScriptBuf, Sequence, TapLeafHash, TapNodeHash,
+    TapSighash, TapSighashType, Transaction, TxIn, TxOut, Witness, WitnessProgram, WitnessVersion,
+    XOnlyPublicKey,
+};
 use ddk::ddk_manager::contract::contract_info::ContractInfo;
 use ddk::ddk_manager::contract::ser::Serializable;
 use ddk::ddk_manager::contract::ContractDescriptor;
@@ -10,15 +21,6 @@ use ddk::ddk_manager::Wallet;
 use ddk::wallet::DlcDevKitWallet;
 use dlc::secp256k1_zkp::{All, Secp256k1};
 use dlc::EnumerationPayout;
-use kormir::bitcoin::absolute::LockTime;
-use kormir::bitcoin::opcodes::all::OP_CHECKMULTISIG;
-use kormir::bitcoin::script::Builder;
-use kormir::bitcoin::taproot::{LeafVersion, TapTree, TaprootBuilder};
-use kormir::bitcoin::transaction::Version;
-use kormir::bitcoin::{
-    Amount, FeeRate, PublicKey, ScriptBuf, Sequence, TapNodeHash, Transaction, TxIn, TxOut,
-    Witness, WitnessProgram, WitnessVersion, XOnlyPublicKey,
-};
 use kormir::{OracleAnnouncement, OracleAttestation};
 use rand::Rng;
 use rand::{rngs::ThreadRng, thread_rng};
@@ -64,12 +66,12 @@ pub struct DlcParty {
     is_offerer: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PartyParams {
     fund_pubkey: Point<EvenY>,
     change_script_pubkey: ScriptBuf,
     // change_serial_id: u64,
-    payout_script_pubkey: Point<EvenY>,
+    payout_address: Address,
     // payout_serial_id: u64,
     collateral: Amount,
     funding_inputs: Vec<TxIn>,
@@ -77,7 +79,7 @@ pub struct PartyParams {
     funding_input_amount: Amount,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DlcOffer {
     contract_id: [u8; 32],
     offer_params: PartyParams,
@@ -86,7 +88,7 @@ pub struct DlcOffer {
     total_collateral: Amount,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DlcAccept {
     contract_id: [u8; 32],
     // Public keys that acceptor shares back
@@ -96,7 +98,7 @@ pub struct DlcAccept {
     offer: DlcOffer,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DlcSign {
     // Offerers encrypted signatures
     cet_adaptor_signatures: Vec<EncryptedSignature>,
@@ -143,6 +145,11 @@ impl DlcParty {
             return Err(TaprootDlcError::NotTaproot);
         }
 
+        let payout_address = self
+            .wallet
+            .get_new_address()
+            .map_err(|_| TaprootDlcError::GetAddress)?;
+
         let funding_inputs = self
             .wallet
             .get_utxos_for_amount(
@@ -163,7 +170,7 @@ impl DlcParty {
 
         let offer_params = PartyParams {
             fund_pubkey: self.funding_keypair.public_key(),
-            payout_script_pubkey: self.payout_keypair.public_key(),
+            payout_address,
             change_script_pubkey,
             collateral: offer_collateral,
             funding_inputs,
@@ -182,12 +189,10 @@ impl DlcParty {
     pub fn accept_dlc(&self, offer: DlcOffer) -> Result<DlcAccept, TaprootDlcError> {
         let accept_collateral = offer.total_collateral - offer.offer_params.collateral;
 
-        let cet_adaptor_signatures = self.create_cet_adaptor_signatures(
-            &offer.contract_info.contract_descriptor,
-            &offer.contract_info.oracle_announcements[0],
-            offer.offer_params.payout_script_pubkey,
-            offer.total_collateral,
-        );
+        let payout_address = self
+            .wallet
+            .get_new_address()
+            .map_err(|_| TaprootDlcError::GetAddress)?;
 
         let change_script_pubkey = self
             .wallet
@@ -216,38 +221,64 @@ impl DlcParty {
         let accept_params = PartyParams {
             fund_pubkey: self.funding_keypair.public_key(),
             change_script_pubkey,
-            payout_script_pubkey: self.payout_keypair.public_key(),
+            payout_address: payout_address.clone(),
             collateral: offer.total_collateral - offer.offer_params.collateral,
             funding_inputs,
             funding_input_amount: Amount::ZERO,
         };
 
-        Ok(DlcAccept {
+        let mut accept = DlcAccept {
             contract_id: offer.contract_id,
-            accept_params,
-            cet_adaptor_signatures,
-            offer,
-        })
+            accept_params: accept_params.clone(),
+            cet_adaptor_signatures: vec![],
+            offer: offer.clone(),
+        };
+
+        let (funding_transaction, funding_script) = self.create_funding_transaction(
+            &accept,
+            accept_params.collateral.clone(),
+            offer.offer_params.collateral.clone(),
+        )?;
+
+        let cet_adaptor_signatures = self.create_cet_adaptor_signatures(
+            &offer.contract_info.contract_descriptor,
+            &offer.contract_info.oracle_announcements[0],
+            offer.offer_params.payout_address.clone(),
+            payout_address.clone(),
+            offer.total_collateral,
+            0,
+            &funding_transaction.output[0],
+            funding_script.as_script(),
+        );
+
+        accept.cet_adaptor_signatures = cet_adaptor_signatures;
+
+        Ok(accept)
     }
 
     pub fn sign_dlc(&self, accept: DlcAccept) -> Result<DlcSign, TaprootDlcError> {
         self.verify_adaptor_signatures(
-            accept.accept_params.payout_script_pubkey,
+            accept.accept_params.payout_address.clone(),
+            accept.offer.offer_params.payout_address.clone(),
             &accept.offer.contract_info.contract_descriptor,
             accept.cet_adaptor_signatures.as_slice(),
             &accept.offer.contract_info.oracle_announcements[0],
             accept.offer.total_collateral,
         )?;
 
+        let (funding_transaction, funding_script) =
+            self.create_funding_transaction(&accept, Amount::ONE_BTC, Amount::ONE_BTC)?;
+
         let cet_adaptor_signatures = self.create_cet_adaptor_signatures(
             &accept.offer.contract_info.contract_descriptor,
             &accept.offer.contract_info.oracle_announcements[0],
-            accept.accept_params.payout_script_pubkey,
+            accept.accept_params.payout_address.clone(),
+            accept.offer.offer_params.payout_address.clone(),
             accept.offer.total_collateral,
+            0,
+            &funding_transaction.output[0],
+            funding_script.as_script(),
         );
-
-        let funding_transaction =
-            self.create_funding_transaction(&accept, Amount::ONE_BTC, Amount::ONE_BTC)?;
 
         Ok(DlcSign {
             cet_adaptor_signatures,
@@ -260,8 +291,12 @@ impl DlcParty {
         &self,
         contract_descriptor: &ContractDescriptor,
         announcement: &OracleAnnouncement,
-        counterparty_pubkey: Point<EvenY>,
+        counterparty_payout_address: Address,
+        my_payout_address: Address,
         total_collateral: Amount,
+        input_index: usize,
+        funding_output: &TxOut,
+        funding_script: &Script,
     ) -> Vec<EncryptedSignature> {
         match contract_descriptor {
             ContractDescriptor::Enum(enumeration) => enumeration
@@ -269,19 +304,19 @@ impl DlcParty {
                 .iter()
                 .enumerate()
                 .map(|(i, outcome)| {
-                    if counterparty_pubkey.to_bytes() == self.payout_keypair.public_key().to_bytes()
-                    {
-                        panic!("Counterparty pubkey is same as self pubkey!");
-                    }
-                    let cet = self
-                        .build_cet(&outcome, counterparty_pubkey, total_collateral)
-                        .serialize()
-                        .unwrap();
+                    let cet = self.build_cet(
+                        &outcome,
+                        counterparty_payout_address.clone(),
+                        my_payout_address.clone(),
+                        total_collateral,
+                    );
 
                     let nonce = announcement.oracle_event.oracle_nonces[i].clone();
                     let oracle_point = convert_xonly_to_normal_point(&nonce);
 
-                    let message = Message::<Secret>::plain("cet", &cet);
+                    let sighash =
+                        create_sighash_msg(&cet, funding_script, input_index, funding_output);
+                    let message = Message::<Secret>::raw(sighash.as_byte_array());
 
                     let encrypted_signature =
                         self.context
@@ -301,47 +336,53 @@ impl DlcParty {
     fn build_cet(
         &self,
         outcome: &EnumerationPayout,
-        counterparty_pubkey: Point<EvenY>,
+        counterparty_payout_address: Address,
+        my_payout_address: Address,
         _total_collateral: Amount,
     ) -> Transaction {
         let input = vec![];
         let mut output = vec![];
 
-        let (offer_pubkey, accept_pubkey) = if self.is_offerer {
-            (self.payout_keypair.public_key(), counterparty_pubkey)
+        let (offer_spk, accept_spk) = if self.is_offerer {
+            (
+                my_payout_address.script_pubkey(),
+                counterparty_payout_address.script_pubkey(),
+            )
         } else {
-            (counterparty_pubkey, self.payout_keypair.public_key())
+            (
+                counterparty_payout_address.script_pubkey(),
+                my_payout_address.script_pubkey(),
+            )
         };
 
         if outcome.payout.offer > 0 {
             output.push(TxOut {
-                script_pubkey: point_to_p2tr_script(&offer_pubkey, &self.secp),
+                script_pubkey: offer_spk,
                 value: Amount::from_sat(outcome.payout.offer),
             });
         }
 
         if outcome.payout.accept > 0 {
             output.push(TxOut {
-                script_pubkey: point_to_p2tr_script(&accept_pubkey, &self.secp),
+                script_pubkey: accept_spk,
                 value: Amount::from_sat(outcome.payout.accept),
             });
         }
 
         // Make sure the total collateral matches the outputs
 
-        let tx = Transaction {
+        Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input,
             output,
-        };
-
-        tx
+        }
     }
 
     fn verify_adaptor_signatures(
         &self,
-        counterparty_pubkey: Point<EvenY>,
+        counterparty_payout_address: Address,
+        my_payout_address: Address,
         contract_descriptor: &ContractDescriptor,
         sigs: &[EncryptedSignature],
         announcement: &OracleAnnouncement,
@@ -356,12 +397,32 @@ impl DlcParty {
             let oracle_point = convert_xonly_to_normal_point(&nonce);
 
             let cet = self
-                .build_cet(&payouts[i], counterparty_pubkey, total_collateral)
+                .build_cet(
+                    &payouts[i],
+                    counterparty_payout_address.clone(),
+                    my_payout_address.clone(),
+                    total_collateral,
+                )
                 .serialize()
                 .unwrap();
             let message = Message::<Secret>::plain("cet", &cet);
+
+            let x_only_pubkey =
+                XOnlyPublicKey::from_slice(counterparty_payout_address.script_pubkey().as_bytes())
+                    .map_err(|_| {
+                        TaprootDlcError::General(
+                            "Failed to convert payout address SPK to XOnlyPublicKey".to_string(),
+                        )
+                    })?;
+            let payout_point: Point<EvenY, Public, NonZero> = Point::from_xonly_bytes(
+                x_only_pubkey.serialize(),
+            )
+            .ok_or(TaprootDlcError::General(
+                "Failed to create Point from XOnlyPublicKey".to_string(),
+            ))?;
+
             if !self.context.verify_encrypted_signature(
-                &counterparty_pubkey,
+                &payout_point,
                 &oracle_point,
                 message,
                 signature,
@@ -386,7 +447,7 @@ impl DlcParty {
         accept_dlc: &DlcAccept,
         accept: Amount,
         offer: Amount,
-    ) -> Result<Transaction, TaprootDlcError> {
+    ) -> Result<(Transaction, ScriptBuf), TaprootDlcError> {
         let funding_script = self.create_funding_script(&accept_dlc)?;
 
         let transaction = Transaction {
@@ -395,11 +456,11 @@ impl DlcParty {
             input: vec![],
             output: vec![TxOut {
                 value: accept + offer,
-                script_pubkey: funding_script,
+                script_pubkey: funding_script.clone(),
             }],
         };
 
-        Ok(transaction)
+        Ok((transaction, funding_script))
     }
 
     fn create_funding_script(&self, accept: &DlcAccept) -> Result<ScriptBuf, TaprootDlcError> {
@@ -459,7 +520,11 @@ impl DlcParty {
             counterparty_signature,
         );
 
-        let funding_script = self.create_funding_script(&sign_dlc.accept)?;
+        let (_, funding_script) = self.create_funding_transaction(
+            &sign_dlc.accept,
+            sign_dlc.accept.accept_params.collateral,
+            sign_dlc.accept.offer.offer_params.collateral,
+        )?;
 
         let tap_tree = TapNodeHash::from_script(funding_script.as_script(), LeafVersion::TapScript);
 
@@ -512,6 +577,26 @@ fn point_to_p2tr_script(point: &Point<EvenY>, secp: &Secp256k1<All>) -> ScriptBu
     let xonly_pubkey = XOnlyPublicKey::from_slice(&xonly_bytes).expect("Valid x-only pubkey");
 
     ScriptBuf::new_p2tr(secp, xonly_pubkey, None)
+}
+
+fn create_sighash_msg<'a>(
+    cet: &'a Transaction,
+    funding_script: &'a Script,
+    input_index: usize,
+    funding_output: &'a TxOut,
+) -> TapSighash {
+    println!("Funding output: {:?}", funding_output);
+    let leaf_hash = TapLeafHash::from_script(funding_script, LeafVersion::TapScript);
+
+    let prevouts = Prevouts::One(input_index, funding_output);
+    SighashCache::new(cet)
+        .taproot_script_spend_signature_hash(
+            input_index,
+            &prevouts,
+            leaf_hash,
+            TapSighashType::Default,
+        )
+        .unwrap()
 }
 
 #[cfg(test)]
