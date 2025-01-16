@@ -13,10 +13,10 @@ use bitcoin::{
     Amount, FeeRate, ScriptBuf, Sequence, TapNodeHash, Transaction, TxIn, TxOut, Witness,
     XOnlyPublicKey,
 };
-use ddk::ddk_manager::contract::contract_info::ContractInfo;
-use ddk::ddk_manager::contract::ser::Serializable;
-use ddk::ddk_manager::contract::ContractDescriptor;
-use ddk::ddk_manager::Wallet;
+use ddk_manager::contract::contract_info::ContractInfo;
+use ddk_manager::contract::ser::Serializable;
+use ddk_manager::contract::ContractDescriptor;
+use ddk_manager::Wallet;
 use dlc::secp256k1_zkp::{All, Secp256k1};
 use dlc::{EnumerationPayout, TxInputInfo};
 use kormir::{OracleAnnouncement, OracleAttestation};
@@ -650,7 +650,7 @@ fn convert_xonly_to_normal_point(x_only_pk: &XOnlyPublicKey) -> Point<Normal, Pu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ddk::ddk_manager::contract::enum_descriptor::EnumDescriptor;
+    use ddk_manager::contract::enum_descriptor::EnumDescriptor;
     use dlc::Payout;
 
     fn announcement() -> OracleAnnouncement {

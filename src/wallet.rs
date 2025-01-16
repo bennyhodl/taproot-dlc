@@ -6,8 +6,9 @@ use bdk_wallet::{KeychainKind, SignOptions, Wallet as BdkWallet};
 use bitcoin::bip32::Xpriv;
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Address, Network, ScriptBuf};
-use ddk::ddk_manager::Wallet;
 use ddk::storage::memory::MemoryStorage;
+use ddk_manager::error::Error;
+use ddk_manager::Wallet;
 use rand::Fill;
 
 pub struct TaprootWallet {
@@ -43,12 +44,12 @@ impl TaprootWallet {
     }
 }
 impl Wallet for TaprootWallet {
-    fn get_new_address(&self) -> Result<bitcoin::Address, ddk::ddk_manager::error::Error> {
+    fn get_new_address(&self) -> Result<bitcoin::Address, Error> {
         let mut wallet = self.wallet.try_write().unwrap();
         Ok(wallet.next_unused_address(KeychainKind::External).address)
     }
 
-    fn get_new_change_address(&self) -> Result<bitcoin::Address, ddk::ddk_manager::error::Error> {
+    fn get_new_change_address(&self) -> Result<bitcoin::Address, Error> {
         let mut wallet = self.wallet.try_write().unwrap();
         Ok(wallet.next_unused_address(KeychainKind::Internal).address)
     }
@@ -58,14 +59,14 @@ impl Wallet for TaprootWallet {
         amount: u64,
         fee_rate: u64,
         lock_utxos: bool,
-    ) -> Result<Vec<ddk::ddk_manager::Utxo>, ddk::ddk_manager::error::Error> {
+    ) -> Result<Vec<ddk_manager::Utxo>, Error> {
         let mut wallet = self.wallet.try_write().unwrap();
         Ok(wallet
             .list_unspent()
             .map(|utxo| {
                 let address =
                     Address::from_script(&utxo.txout.script_pubkey, wallet.network()).unwrap();
-                ddk::ddk_manager::Utxo {
+                ddk_manager::Utxo {
                     tx_out: utxo.txout.clone(),
                     outpoint: utxo.outpoint,
                     address,
@@ -76,18 +77,11 @@ impl Wallet for TaprootWallet {
             .collect())
     }
 
-    fn import_address(
-        &self,
-        address: &bitcoin::Address,
-    ) -> Result<(), ddk::ddk_manager::error::Error> {
+    fn import_address(&self, address: &bitcoin::Address) -> Result<(), Error> {
         unimplemented!("No importing addresses for bdk_wallet")
     }
 
-    fn sign_psbt_input(
-        &self,
-        psbt: &mut bitcoin::Psbt,
-        input_index: usize,
-    ) -> Result<(), ddk::ddk_manager::error::Error> {
+    fn sign_psbt_input(&self, psbt: &mut bitcoin::Psbt, input_index: usize) -> Result<(), Error> {
         let mut wallet = self.wallet.try_write().unwrap();
         let sign_opts = SignOptions {
             trust_witness_utxo: true,
@@ -104,10 +98,7 @@ impl Wallet for TaprootWallet {
         Ok(())
     }
 
-    fn unreserve_utxos(
-        &self,
-        outpoints: &[bitcoin::OutPoint],
-    ) -> Result<(), ddk::ddk_manager::error::Error> {
+    fn unreserve_utxos(&self, outpoints: &[bitcoin::OutPoint]) -> Result<(), Error> {
         unimplemented!("not needed for bdk_wallet")
     }
 }
