@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bdk_wallet = "1.0.0"
+bdk_wallet = "=1.0.0-beta.5"
 bitcoin = "0.32.5"
 dlc = "0.7.1"
 dlc-trie = "0.7.1"
@@ -17,5 +17,6 @@ secp256k1-zkp = "0.11.0"
 serde_json = "1.0.133"
 sha2 = "0.10.8"
 thiserror = "2.0.8"
-ddk = { path = "../dlcdevkit/ddk" }
 dlc-messages = "0.7.1"
+ddk-manager = "0.7.2"
+ddk = "0.0.13"
