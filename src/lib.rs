@@ -1,24 +1,24 @@
 #![allow(dead_code, unused)]
-mod oracle;
+mod port;
+mod util;
 mod wallet;
 
-use bitcoin::taproot::{ControlBlock, TaprootMerkleBranch};
+use bitcoin::absolute::LockTime;
+use bitcoin::opcodes::all::{OP_CHECKSIG, OP_CHECKSIGADD, OP_NUMEQUALVERIFY};
+use bitcoin::script::Builder;
+use bitcoin::taproot::ControlBlock;
+use bitcoin::taproot::LeafVersion;
+use bitcoin::transaction::Version;
+use bitcoin::{
+    Amount, FeeRate, ScriptBuf, Sequence, TapNodeHash, Transaction, TxIn, TxOut, Witness,
+    XOnlyPublicKey,
+};
 use ddk::ddk_manager::contract::contract_info::ContractInfo;
 use ddk::ddk_manager::contract::ser::Serializable;
 use ddk::ddk_manager::contract::ContractDescriptor;
 use ddk::ddk_manager::Wallet;
-use ddk::wallet::DlcDevKitWallet;
 use dlc::secp256k1_zkp::{All, Secp256k1};
-use dlc::EnumerationPayout;
-use kormir::bitcoin::absolute::LockTime;
-use kormir::bitcoin::opcodes::all::OP_CHECKMULTISIG;
-use kormir::bitcoin::script::Builder;
-use kormir::bitcoin::taproot::{LeafVersion, TapTree, TaprootBuilder};
-use kormir::bitcoin::transaction::Version;
-use kormir::bitcoin::{
-    Amount, FeeRate, PublicKey, ScriptBuf, Sequence, TapNodeHash, Transaction, TxIn, TxOut,
-    Witness, WitnessProgram, WitnessVersion, XOnlyPublicKey,
-};
+use dlc::{EnumerationPayout, TxInputInfo};
 use kormir::{OracleAnnouncement, OracleAttestation};
 use rand::Rng;
 use rand::{rngs::ThreadRng, thread_rng};
@@ -56,25 +56,127 @@ pub enum TaprootDlcError {
 }
 
 pub struct DlcParty {
+    // For rust-bitcoin specific methods
     secp: Secp256k1<All>,
+    // For Schnorr signing and verification of adaptor signatures
     context: Schnorr<Sha256, Synthetic<Sha256, GlobalRng<ThreadRng>>>,
-    funding_keypair: KeyPair<EvenY>,
-    payout_keypair: KeyPair<EvenY>,
+    // The keypair used for funding pubkeys
+    keypair: KeyPair<EvenY>,
+    // The funding pubkey (stored for quick access)
+    funding_pubkey: XOnlyPublicKey,
+    // The wallet used for funding and spending
     wallet: TaprootWallet,
+    // Whether this party is the offerer or acceptor
     is_offerer: bool,
 }
 
 #[derive(Debug)]
 pub struct PartyParams {
-    fund_pubkey: Point<EvenY>,
-    change_script_pubkey: ScriptBuf,
-    // change_serial_id: u64,
-    payout_script_pubkey: Point<EvenY>,
-    // payout_serial_id: u64,
+    fund_pubkey: XOnlyPublicKey,
+    // The payout script for receiving the payout
+    payout_spk: ScriptBuf,
+    // The change script for receiving the change of a funding transaction
+    change_spk: ScriptBuf,
+    // The serial id of the change output
+    change_serial_id: u64,
+    // The serial id of the payout output
+    payout_serial_id: u64,
     collateral: Amount,
-    funding_inputs: Vec<TxIn>,
-    // Amount that is in inputs
-    funding_input_amount: Amount,
+    inputs: Vec<TxInputInfo>,
+    input_amount: Amount,
+}
+
+impl PartyParams {
+    /// Returns the change output for a single party as well as the fees that
+    /// they are required to pay for the fund transaction and the cet or refund transaction.
+    /// The change output value already accounts for the required fees.
+    /// If input amount (sum of all input values) is lower than the sum of the collateral
+    /// plus the required fees, an error is returned.
+    pub fn get_change_output_and_fees(
+        &self,
+        fee_rate_per_vb: u64,
+        extra_fee: Amount,
+    ) -> Result<(TxOut, Amount, Amount), dlc::Error> {
+        let mut inputs_weight: usize = 0;
+
+        for w in &self.inputs {
+            let script_weight = util::redeem_script_to_script_sig(&w.redeem_script)
+                .len()
+                .checked_mul(4)
+                .ok_or(dlc::Error::InvalidArgument)?;
+            inputs_weight = crate::checked_add!(
+                inputs_weight,
+                crate::port::TX_INPUT_BASE_WEIGHT,
+                script_weight,
+                w.max_witness_len
+            )?;
+        }
+
+        // Value size + script length var_int + ouput script pubkey size
+        let change_size = self.change_spk.len();
+        // Change size is scaled by 4 from vBytes to weight units
+        let change_weight = change_size
+            .checked_mul(4)
+            .ok_or(dlc::Error::InvalidArgument)?;
+
+        // Base weight (nLocktime, nVersion, ...) is distributed among parties
+        // independently of inputs contributed
+        let this_party_fund_base_weight = crate::port::FUND_TX_BASE_WEIGHT / 2;
+
+        let total_fund_weight = checked_add!(
+            this_party_fund_base_weight,
+            inputs_weight,
+            change_weight,
+            36
+        )?;
+        let fund_fee = util::weight_to_fee(total_fund_weight, fee_rate_per_vb)?;
+
+        // Base weight (nLocktime, nVersion, funding input ...) is distributed
+        // among parties independently of output types
+        let this_party_cet_base_weight = crate::port::CET_BASE_WEIGHT / 2;
+
+        // size of the payout script pubkey scaled by 4 from vBytes to weight units
+        let output_spk_weight = self
+            .payout_spk
+            .len()
+            .checked_mul(4)
+            .ok_or(dlc::Error::InvalidArgument)?;
+        let total_cet_weight = checked_add!(this_party_cet_base_weight, output_spk_weight)?;
+        let cet_or_refund_fee = util::weight_to_fee(total_cet_weight, fee_rate_per_vb)?;
+        let required_input_funds =
+            checked_add!(self.collateral, fund_fee, cet_or_refund_fee, extra_fee)?;
+        if self.input_amount < required_input_funds {
+            return Err(dlc::Error::InvalidArgument);
+        }
+
+        let change_output = TxOut {
+            value: self.input_amount - required_input_funds,
+            script_pubkey: self.change_spk.clone(),
+        };
+
+        Ok((change_output, fund_fee, cet_or_refund_fee))
+    }
+
+    pub fn get_unsigned_tx_inputs_and_serial_ids(
+        &self,
+        sequence: Sequence,
+    ) -> (Vec<TxIn>, Vec<u64>) {
+        let mut tx_ins = Vec::with_capacity(self.inputs.len());
+        let mut serial_ids = Vec::with_capacity(self.inputs.len());
+
+        for input in &self.inputs {
+            let tx_in = TxIn {
+                previous_output: input.outpoint,
+                script_sig: util::redeem_script_to_script_sig(&input.redeem_script),
+                sequence,
+                witness: Witness::new(),
+            };
+            tx_ins.push(tx_in);
+            serial_ids.push(input.outpoint.vout as u64);
+        }
+
+        (tx_ins, serial_ids)
+    }
 }
 
 #[derive(Debug)]
@@ -89,37 +191,53 @@ pub struct DlcOffer {
 #[derive(Debug)]
 pub struct DlcAccept {
     contract_id: [u8; 32],
-    // Public keys that acceptor shares back
+    // Party params that acceptor shares back
     accept_params: PartyParams,
-    // Encrypted signatures for each CET
+    // Encrypted signatures for each CET generated by the acceptor
     cet_adaptor_signatures: Vec<EncryptedSignature>,
+
+    // TODO: refund signature
+    // refund_signature: Signature,
+
+    // Should be an offered contract that both parties
+    // have stored so that they can get the contract
+    // info and oracle announcements.
     offer: DlcOffer,
 }
 
 #[derive(Debug)]
 pub struct DlcSign {
-    // Offerers encrypted signatures
+    contract_id: [u8; 32],
+    // Offerers encrypted signatures to be verified by the acceptor
     cet_adaptor_signatures: Vec<EncryptedSignature>,
-    // Funding signatures
+
+    // TODO The funding signatures for the acceptor to use to broadcast the funding transaction
     funding_transaction: Transaction,
+
+    // Refund signature
+    // refund_signature: Signature,
     accept: DlcAccept,
 }
 
 impl DlcParty {
     pub fn new(wallet: TaprootWallet, is_offerer: bool) -> Self {
         let secp = Secp256k1::new();
-        // Create Schnorr context with synthetic nonces
         let nonce_gen = Synthetic::<Sha256, GlobalRng<ThreadRng>>::default();
         let context = Schnorr::<Sha256, _>::new(nonce_gen);
 
-        // Generate a new random keypair
-        let funding_keypair = context.new_keypair(Scalar::random(&mut thread_rng()));
-        let payout_keypair = context.new_keypair(Scalar::random(&mut thread_rng()));
+        // Generate a new random keypair, should use from the wallet
+        // The keypair acts the same as the `ddk_manager::ContractSigner`.
+        // We can really just generate a funding pubkey with an XOnlyPublicKey
+        // ContractSigner and ContractSignerProvider.
+        let keypair = context.new_keypair(Scalar::random(&mut thread_rng()));
+        let funding_pubkey =
+            XOnlyPublicKey::from_slice(&keypair.public_key().to_xonly_bytes()).unwrap();
+
         Self {
             secp,
             context,
-            funding_keypair,
-            payout_keypair,
+            keypair,
+            funding_pubkey,
             wallet,
             is_offerer,
         }
@@ -133,15 +251,6 @@ impl DlcParty {
         fee_rate: FeeRate,
     ) -> Result<DlcOffer, TaprootDlcError> {
         let contract_id = new_temporary_id();
-        let change_script_pubkey = self
-            .wallet
-            .get_new_change_address()
-            .map_err(|_| TaprootDlcError::GetAddress)?
-            .script_pubkey();
-
-        if !change_script_pubkey.is_p2tr() {
-            return Err(TaprootDlcError::NotTaproot);
-        }
 
         let funding_inputs = self
             .wallet
@@ -152,26 +261,37 @@ impl DlcParty {
             )
             .map_err(|e| TaprootDlcError::General(e.to_string()))?
             .iter()
-            .map(|input| TxIn {
-                previous_output: input.outpoint,
-                script_sig: input.redeem_script.clone(),
-                sequence: Sequence::MAX,
-                // witness can be empty right?
-                witness: Witness::default(),
+            .map(|input| TxInputInfo {
+                outpoint: input.outpoint,
+                redeem_script: input.redeem_script.clone(),
+                max_witness_len: 108,
+                serial_id: input.outpoint.vout as u64,
             })
-            .collect::<Vec<TxIn>>();
+            .collect::<Vec<TxInputInfo>>();
+
+        let payout_spk = self.wallet.get_new_address().unwrap().script_pubkey();
+        let change_spk = self
+            .wallet
+            .get_new_change_address()
+            .map_err(|_| TaprootDlcError::GetAddress)?
+            .script_pubkey();
+        if !change_spk.is_p2tr() {
+            return Err(TaprootDlcError::NotTaproot);
+        }
 
         let offer_params = PartyParams {
-            fund_pubkey: self.funding_keypair.public_key(),
-            payout_script_pubkey: self.payout_keypair.public_key(),
-            change_script_pubkey,
+            fund_pubkey: self.funding_pubkey,
+            payout_spk,
+            change_spk,
             collateral: offer_collateral,
-            funding_inputs,
-            funding_input_amount: Amount::ZERO,
+            inputs: funding_inputs,
+            input_amount: Amount::ZERO,
+            change_serial_id: 0,
+            payout_serial_id: 0,
         };
 
         Ok(DlcOffer {
-            contract_id: new_temporary_id(),
+            contract_id,
             offer_params,
             contract_info,
             fee_rate,
@@ -182,19 +302,6 @@ impl DlcParty {
     pub fn accept_dlc(&self, offer: DlcOffer) -> Result<DlcAccept, TaprootDlcError> {
         let accept_collateral = offer.total_collateral - offer.offer_params.collateral;
 
-        let cet_adaptor_signatures = self.create_cet_adaptor_signatures(
-            &offer.contract_info.contract_descriptor,
-            &offer.contract_info.oracle_announcements[0],
-            offer.offer_params.payout_script_pubkey,
-            offer.total_collateral,
-        );
-
-        let change_script_pubkey = self
-            .wallet
-            .get_new_change_address()
-            .map_err(|_| TaprootDlcError::GetAddress)?
-            .script_pubkey();
-
         let funding_inputs = self
             .wallet
             .get_utxos_for_amount(
@@ -204,23 +311,38 @@ impl DlcParty {
             )
             .map_err(|e| TaprootDlcError::General(e.to_string()))?
             .iter()
-            .map(|input| TxIn {
-                previous_output: input.outpoint,
-                script_sig: input.redeem_script.clone(),
-                sequence: Sequence::MAX,
-                // witness can be empty right?
-                witness: Witness::default(),
+            .map(|input| TxInputInfo {
+                outpoint: input.outpoint,
+                redeem_script: input.redeem_script.clone(),
+                max_witness_len: 108,
+                serial_id: input.outpoint.vout as u64,
             })
-            .collect::<Vec<TxIn>>();
+            .collect::<Vec<TxInputInfo>>();
+
+        let payout_spk = self.wallet.get_new_address().unwrap().script_pubkey();
+        let change_spk = self
+            .wallet
+            .get_new_change_address()
+            .map_err(|_| TaprootDlcError::GetAddress)?
+            .script_pubkey();
 
         let accept_params = PartyParams {
-            fund_pubkey: self.funding_keypair.public_key(),
-            change_script_pubkey,
-            payout_script_pubkey: self.payout_keypair.public_key(),
+            fund_pubkey: self.funding_pubkey,
+            change_spk,
+            payout_spk,
             collateral: offer.total_collateral - offer.offer_params.collateral,
-            funding_inputs,
-            funding_input_amount: Amount::ZERO,
+            inputs: funding_inputs,
+            input_amount: Amount::ZERO,
+            change_serial_id: 0,
+            payout_serial_id: 0,
         };
+
+        let cet_adaptor_signatures = self.create_cet_adaptor_signatures(
+            &offer.contract_info.contract_descriptor,
+            &offer.contract_info.oracle_announcements[0],
+            offer.offer_params.payout_spk.clone(),
+            accept_params.payout_spk.clone(),
+        );
 
         Ok(DlcAccept {
             contract_id: offer.contract_id,
@@ -232,36 +354,44 @@ impl DlcParty {
 
     pub fn sign_dlc(&self, accept: DlcAccept) -> Result<DlcSign, TaprootDlcError> {
         self.verify_adaptor_signatures(
-            accept.accept_params.payout_script_pubkey,
+            accept.accept_params.payout_spk.clone(),
+            accept.offer.offer_params.payout_spk.clone(),
             &accept.offer.contract_info.contract_descriptor,
             accept.cet_adaptor_signatures.as_slice(),
             &accept.offer.contract_info.oracle_announcements[0],
-            accept.offer.total_collateral,
+            &accept,
         )?;
 
         let cet_adaptor_signatures = self.create_cet_adaptor_signatures(
-            &accept.offer.contract_info.contract_descriptor,
+            &accept.offer.contract_info.contract_descriptor.clone(),
             &accept.offer.contract_info.oracle_announcements[0],
-            accept.accept_params.payout_script_pubkey,
-            accept.offer.total_collateral,
+            accept.accept_params.payout_spk.clone(),
+            accept.offer.offer_params.payout_spk.clone(),
         );
 
+        // Sign half of the funding transaction
         let funding_transaction =
             self.create_funding_transaction(&accept, Amount::ONE_BTC, Amount::ONE_BTC)?;
 
         Ok(DlcSign {
+            contract_id: accept.contract_id,
             cet_adaptor_signatures,
             funding_transaction,
             accept,
         })
     }
 
+    // verify sign and broadcast
+    pub fn verify_sign_and_broadcast(&self, _sign: DlcSign) -> Result<(), TaprootDlcError> {
+        Ok(())
+    }
+
     fn create_cet_adaptor_signatures(
         &self,
         contract_descriptor: &ContractDescriptor,
         announcement: &OracleAnnouncement,
-        counterparty_pubkey: Point<EvenY>,
-        total_collateral: Amount,
+        counterparty_script_pubkey: ScriptBuf,
+        payout_script_pubkey: ScriptBuf,
     ) -> Vec<EncryptedSignature> {
         match contract_descriptor {
             ContractDescriptor::Enum(enumeration) => enumeration
@@ -269,12 +399,15 @@ impl DlcParty {
                 .iter()
                 .enumerate()
                 .map(|(i, outcome)| {
-                    if counterparty_pubkey.to_bytes() == self.payout_keypair.public_key().to_bytes()
-                    {
+                    if counterparty_script_pubkey == payout_script_pubkey {
                         panic!("Counterparty pubkey is same as self pubkey!");
                     }
                     let cet = self
-                        .build_cet(&outcome, counterparty_pubkey, total_collateral)
+                        .build_cet(
+                            &outcome,
+                            counterparty_script_pubkey.clone(),
+                            payout_script_pubkey.clone(),
+                        )
                         .serialize()
                         .unwrap();
 
@@ -283,9 +416,10 @@ impl DlcParty {
 
                     let message = Message::<Secret>::plain("cet", &cet);
 
+                    // TODO: use a ContractSignerProvider providing XOnlyPublicKey and Scalar/PrivateKey
                     let encrypted_signature =
                         self.context
-                            .encrypted_sign(&self.payout_keypair, &oracle_point, message);
+                            .encrypted_sign(&self.keypair, &oracle_point, message);
 
                     encrypted_signature
                 })
@@ -297,32 +431,31 @@ impl DlcParty {
         }
     }
 
-    // Need to specify who is offer and who is accept.
     fn build_cet(
         &self,
         outcome: &EnumerationPayout,
-        counterparty_pubkey: Point<EvenY>,
-        _total_collateral: Amount,
+        counterparty_script_pubkey: ScriptBuf,
+        my_script_pubkey: ScriptBuf,
     ) -> Transaction {
         let input = vec![];
         let mut output = vec![];
 
         let (offer_pubkey, accept_pubkey) = if self.is_offerer {
-            (self.payout_keypair.public_key(), counterparty_pubkey)
+            (my_script_pubkey, counterparty_script_pubkey)
         } else {
-            (counterparty_pubkey, self.payout_keypair.public_key())
+            (counterparty_script_pubkey, my_script_pubkey)
         };
 
         if outcome.payout.offer > 0 {
             output.push(TxOut {
-                script_pubkey: point_to_p2tr_script(&offer_pubkey, &self.secp),
+                script_pubkey: offer_pubkey,
                 value: Amount::from_sat(outcome.payout.offer),
             });
         }
 
         if outcome.payout.accept > 0 {
             output.push(TxOut {
-                script_pubkey: point_to_p2tr_script(&accept_pubkey, &self.secp),
+                script_pubkey: accept_pubkey,
                 value: Amount::from_sat(outcome.payout.accept),
             });
         }
@@ -341,11 +474,12 @@ impl DlcParty {
 
     fn verify_adaptor_signatures(
         &self,
-        counterparty_pubkey: Point<EvenY>,
+        counterparty_script_pubkey: ScriptBuf,
+        payout_script_pubkey: ScriptBuf,
         contract_descriptor: &ContractDescriptor,
         sigs: &[EncryptedSignature],
         announcement: &OracleAnnouncement,
-        total_collateral: Amount,
+        accept: &DlcAccept,
     ) -> Result<(), TaprootDlcError> {
         let payouts = match contract_descriptor {
             ContractDescriptor::Enum(e) => e.outcome_payouts.as_slice(),
@@ -356,12 +490,25 @@ impl DlcParty {
             let oracle_point = convert_xonly_to_normal_point(&nonce);
 
             let cet = self
-                .build_cet(&payouts[i], counterparty_pubkey, total_collateral)
+                .build_cet(
+                    &payouts[i],
+                    counterparty_script_pubkey.clone(),
+                    payout_script_pubkey.clone(),
+                )
                 .serialize()
                 .unwrap();
             let message = Message::<Secret>::plain("cet", &cet);
+
+            let verify_key = if self.is_offerer {
+                Point::<EvenY>::from_xonly_bytes(accept.accept_params.fund_pubkey.serialize())
+                    .unwrap()
+            } else {
+                Point::<EvenY>::from_xonly_bytes(accept.offer.offer_params.fund_pubkey.serialize())
+                    .unwrap()
+            };
+
             if !self.context.verify_encrypted_signature(
-                &counterparty_pubkey,
+                &verify_key,
                 &oracle_point,
                 message,
                 signature,
@@ -404,47 +551,48 @@ impl DlcParty {
 
     fn create_funding_script(&self, accept: &DlcAccept) -> Result<ScriptBuf, TaprootDlcError> {
         // Can use the serial ordering in rust-dlc insteaf
-        let (first_pubkey, second_pubkey) = if self.funding_keypair.public_key().to_xonly_bytes()
-            < accept.accept_params.fund_pubkey.to_xonly_bytes()
-        {
-            (
-                point_to_pubkey(self.funding_keypair.public_key())?,
-                point_to_pubkey(accept.accept_params.fund_pubkey)?,
-            )
-        } else {
-            (
-                point_to_pubkey(accept.accept_params.fund_pubkey)?,
-                point_to_pubkey(self.funding_keypair.public_key())?,
-            )
-        };
+        let (first_pubkey, second_pubkey) =
+            if accept.offer.offer_params.fund_pubkey < accept.accept_params.fund_pubkey {
+                (
+                    accept.offer.offer_params.fund_pubkey,
+                    accept.accept_params.fund_pubkey,
+                )
+            } else {
+                (
+                    accept.accept_params.fund_pubkey,
+                    accept.offer.offer_params.fund_pubkey,
+                )
+            };
 
         let script_spend = Builder::new()
+            .push_x_only_key(&first_pubkey)
+            .push_opcode(OP_CHECKSIG)
+            .push_x_only_key(&second_pubkey)
+            .push_opcode(OP_CHECKSIGADD)
             .push_int(2)
-            .push_key(&first_pubkey)
-            .push_key(&second_pubkey)
-            .push_int(2)
-            .push_opcode(OP_CHECKMULTISIG)
+            .push_opcode(OP_NUMEQUALVERIFY)
             .into_script();
 
         let tap_tree = TapNodeHash::from_script(script_spend.as_script(), LeafVersion::TapScript);
+
         // Create an internal key using secp256kfun
         let internal_keypair = self
             .context
             .new_keypair(Scalar::random(&mut rand::thread_rng()));
-        let internal_pubkey = internal_keypair.public_key();
+        let internal_pubkey = internal_keypair.public_key().to_xonly_bytes();
 
         Ok(ScriptBuf::new_p2tr(
             &self.secp,
-            XOnlyPublicKey::from_slice(&internal_pubkey.to_xonly_bytes()).unwrap(),
+            XOnlyPublicKey::from_slice(&internal_pubkey).unwrap(),
             Some(tap_tree),
         ))
     }
 
     fn spend_cet(
         &self,
-        funding_transaction: Transaction,
+        _funding_transaction: Transaction,
         cet: &mut Transaction,
-        attestation: OracleAttestation,
+        _attestation: OracleAttestation,
         oracle_signature: Signature,
         counterparty_signature: EncryptedSignature,
         encrypted_signature: EncryptedSignature,
@@ -463,15 +611,16 @@ impl DlcParty {
 
         let tap_tree = TapNodeHash::from_script(funding_script.as_script(), LeafVersion::TapScript);
 
-        let internal_keypair = self.context.new_keypair(Scalar::random(&mut thread_rng()));
-        let internal_pubkey = internal_keypair.public_key();
+        // Throwaway pubkey
+        let (internal_key, _) =
+            bitcoin::secp256k1::Keypair::new(&self.secp, &mut rand::thread_rng())
+                .x_only_public_key();
 
         let control_block = ControlBlock {
             leaf_version: LeafVersion::TapScript,
             output_key_parity: bitcoin::key::Parity::Even,
             // i think this should be the internal key used above. Probably should be used
-            internal_key: XOnlyPublicKey::from_slice(&internal_pubkey.to_xonly_bytes())
-                .map_err(|_| TaprootDlcError::Secp)?,
+            internal_key,
             merkle_branch: vec![tap_tree].try_into().unwrap(),
         };
 
@@ -491,12 +640,6 @@ fn new_temporary_id() -> [u8; 32] {
     thread_rng().gen::<[u8; 32]>()
 }
 
-fn point_to_pubkey(point: Point<EvenY>) -> Result<PublicKey, TaprootDlcError> {
-    let point_bytes = point.to_bytes();
-    let pubkey = PublicKey::from_slice(&point_bytes).map_err(|_| TaprootDlcError::Secp)?;
-    Ok(pubkey)
-}
-
 fn convert_xonly_to_normal_point(x_only_pk: &XOnlyPublicKey) -> Point<Normal, Public, NonZero> {
     let xonly_bytess = x_only_pk.serialize();
     let oracle_point: Point<EvenY, Public, NonZero> =
@@ -504,79 +647,17 @@ fn convert_xonly_to_normal_point(x_only_pk: &XOnlyPublicKey) -> Point<Normal, Pu
     oracle_point.normalize()
 }
 
-fn point_to_p2tr_script(point: &Point<EvenY>, secp: &Secp256k1<All>) -> ScriptBuf {
-    // Get x-only pubkey bytes
-    let xonly_bytes = point.to_xonly_bytes();
-
-    // Convert to XOnlyPublicKey first to ensure consistent encoding
-    let xonly_pubkey = XOnlyPublicKey::from_slice(&xonly_bytes).expect("Valid x-only pubkey");
-
-    ScriptBuf::new_p2tr(secp, xonly_pubkey, None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::Network;
-    use ddk::ddk_manager::{
-        contract::{enum_descriptor::EnumDescriptor, numerical_descriptor::NumericalDescriptor},
-        payout_curve::{
-            PayoutFunction, PayoutFunctionPiece, PayoutPoint, PolynomialPayoutCurvePiece,
-            RoundingInterval, RoundingIntervals,
-        },
-    };
+    use ddk::ddk_manager::contract::enum_descriptor::EnumDescriptor;
     use dlc::Payout;
-    use dlc_trie::OracleNumericInfo;
-    use kormir::OracleAnnouncement;
-    use rand::Fill;
-    use std::sync::Arc;
 
     fn announcement() -> OracleAnnouncement {
         serde_json::from_str::<OracleAnnouncement>(include_str!("../announcement.json")).unwrap()
     }
 
     fn contract_descriptor() -> ContractDescriptor {
-        // // Create payout points for a price range
-        // let payout_points = vec![
-        //     PayoutPoint {
-        //         event_outcome: 0,   // $0
-        //         extra_precision: 2, // 2 decimal places per oracle spec
-        //         outcome_payout: 0,  // 0 sats
-        //     },
-        //     PayoutPoint {
-        //         event_outcome: 50000, // $50,000
-        //         extra_precision: 2,
-        //         outcome_payout: 100000000, // 1 BTC
-        //     },
-        // ];
-
-        // let function_pieces = PayoutFunctionPiece::PolynomialPayoutCurvePiece(
-        //     PolynomialPayoutCurvePiece::new(payout_points).unwrap(),
-        // );
-
-        // let payout_function = PayoutFunction::new(vec![function_pieces]).unwrap();
-
-        // // Create rounding interval (1 = no rounding)
-        // let rounding_intervals = RoundingIntervals {
-        //     intervals: vec![RoundingInterval {
-        //         begin_interval: 0,
-        //         rounding_mod: 1,
-        //     }],
-        // };
-
-        // Set oracle info from the announcement
-        let oracle_numeric_infos = OracleNumericInfo {
-            base: 2,
-            nb_digits: vec![20],
-        };
-
-        // let numerical_descriptor = NumericalDescriptor {
-        //     payout_function,
-        //     rounding_intervals,
-        //     difference_params: None, // No difference params needed
-        //     oracle_numeric_infos,
-        // };
-
         let enumeration_descriptor = EnumDescriptor {
             outcome_payouts: vec![
                 EnumerationPayout {
@@ -595,7 +676,6 @@ mod tests {
                 },
             ],
         };
-        // ContractDescriptor::Numerical(numerical_descriptor)
         ContractDescriptor::Enum(enumeration_descriptor)
     }
     #[test]
@@ -627,3 +707,45 @@ mod tests {
         let _ = alice.sign_dlc(accept).unwrap();
     }
 }
+
+// struct OfferDlc {
+//     ❌ protocol_version: u32,
+//     ❌ contract_flags: u8,
+//     ❌ chain_hash: [u8; 32],
+//     ❌ temporary_contract_id: [u8; 32],
+//     ✅ contract_info: ContractInfo,
+//     ✅ funding_pubkey: PublicKey,
+//     ✅ payout_spk: ScriptBuf,
+//     ✅ payout_serial_id: u64,
+//     ✅ offer_collateral: u64,
+//     ✅ funding_inputs: Vec<FundingInput>,
+//     ✅ change_spk: ScriptBuf,
+//     ✅ change_serial_id: u64,
+//     ❌ fund_output_serial_id: u64,
+//     ✅ fee_rate_per_vb: u64,
+//     ❌ cet_locktime: u32,
+//     ❌ refund_locktime: u32,
+// }
+
+// struct AcceptDlc {
+//     ❌ protocol_version: u32,
+//     ❌ temporary_contract_id: [u8; 32],
+//     ✅ accept_collateral: u64,
+//     ✅ funding_pubkey: PublicKey,
+//     ✅ payout_spk: ScriptBuf,
+//     ✅ payout_serial_id: u64,
+//     ✅ funding_inputs: Vec<FundingInput>,
+//     ✅ change_spk: ScriptBuf,
+//     ✅ change_serial_id: u64,
+//     ✅ cet_adaptor_signatures: CetAdaptorSignatures,
+//     ✅ refund_signature: Signature,
+//     ❌ negotiation_fields: Option<NegotiationFields>,
+// }
+
+// struct SignDlc {
+//     ❌ protocol_version: u32,
+//     ✅ contract_id: [u8; 32],
+//     ✅ cet_adaptor_signatures: CetAdaptorSignatures,
+//     ❌ refund_signature: Signature,
+//     ❌ funding_signatures: FundingSignatures,
+// }
