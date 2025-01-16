@@ -451,9 +451,9 @@ dependencies = [
  "futures",
  "hex-conservative 0.1.2",
  "lightning",
- "log",
  "secp256k1-zkp",
  "serde",
+ "tracing",
 ]
 
 [[package]]
@@ -1826,6 +1826,7 @@ dependencies = [
  "bitcoin",
  "ddk",
  "dlc",
+ "dlc-messages",
  "dlc-trie",
  "hex",
  "kormir",
