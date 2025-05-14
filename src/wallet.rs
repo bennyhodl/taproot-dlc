@@ -1,20 +1,27 @@
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 
+use bdk_esplora::esplora_client::blocking::BlockingClient;
+use bdk_esplora::esplora_client::Builder;
+use bdk_esplora::EsploraExt;
 use bdk_wallet::descriptor::IntoWalletDescriptor;
 use bdk_wallet::template::Bip86;
-use bdk_wallet::{KeychainKind, SignOptions, Wallet as BdkWallet};
+use bdk_wallet::{Balance, KeychainKind, SignOptions, Update, Wallet as BdkWallet};
 use bitcoin::bip32::Xpriv;
 use bitcoin::secp256k1::Secp256k1;
-use bitcoin::{Address, Network, ScriptBuf};
+use bitcoin::{Address, Amount, Network, ScriptBuf};
+use bitcoincore_rpc::{Client, RpcApi};
 use ddk::storage::memory::MemoryStorage;
 use ddk_manager::error::Error;
 use ddk_manager::Wallet;
 use rand::Fill;
 
 pub struct TaprootWallet {
-    wallet: RwLock<BdkWallet>,
+    pub wallet: RwLock<BdkWallet>,
     storage: MemoryStorage,
+    blockchain: BlockingClient,
 }
+
 impl TaprootWallet {
     pub fn wallet() -> Self {
         let network = Network::Regtest;
@@ -37,12 +44,67 @@ impl TaprootWallet {
             .create_wallet_no_persist()
             .unwrap();
 
+        let blockchain = Builder::new("http://localhost:30000").build_blocking();
+
         Self {
             wallet: RwLock::new(wallet),
             storage: MemoryStorage::new(),
+            blockchain,
         }
     }
+
+    pub fn balance(&self) -> Result<Balance, Error> {
+        let mut wallet = self.wallet.try_read().unwrap();
+        Ok(wallet.balance())
+    }
+
+    pub fn sync(&self) -> anyhow::Result<()> {
+        let mut wallet = self.wallet.try_write().unwrap();
+        let prev_tip = wallet.latest_checkpoint();
+        let spks = wallet
+            .start_sync_with_revealed_spks()
+            .chain_tip(prev_tip)
+            .build();
+        let sync = self.blockchain.sync(spks, 1)?;
+        let indices = wallet.derivation_index(KeychainKind::External).unwrap_or(0);
+        let internal_index = wallet.derivation_index(KeychainKind::Internal).unwrap_or(0);
+        let mut last_active_indices = BTreeMap::new();
+        last_active_indices.insert(KeychainKind::External, indices);
+        last_active_indices.insert(KeychainKind::Internal, internal_index);
+        let update = Update {
+            last_active_indices,
+            tx_update: sync.tx_update,
+            chain: sync.chain_update,
+        };
+        wallet.apply_update(update)?;
+
+        Ok(())
+    }
+
+    pub fn faucet(&self, amount: Option<Amount>, client: &Client) -> Result<(), anyhow::Error> {
+        let mut wallet = self.wallet.try_write().unwrap();
+        let address = wallet.next_unused_address(KeychainKind::External).address;
+        tracing::info!("Fauceting to address: {}", address);
+        client
+            .send_to_address(
+                &address,
+                amount.unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let faucet_address = client.get_new_address(None, None).unwrap();
+        client
+            .generate_to_address(10, &faucet_address.assume_checked())
+            .unwrap();
+        Ok(())
+    }
 }
+
 impl Wallet for TaprootWallet {
     fn get_new_address(&self) -> Result<bitcoin::Address, Error> {
         let mut wallet = self.wallet.try_write().unwrap();
