@@ -4,7 +4,7 @@ mod util;
 pub mod wallet;
 
 use bitcoin::absolute::LockTime;
-use bitcoin::hashes::Hash;
+use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::opcodes::all::{OP_CHECKSIG, OP_CHECKSIGADD, OP_NUMEQUALVERIFY};
 use bitcoin::script::Builder;
 use bitcoin::sighash::{Prevouts, SighashCache};
@@ -74,6 +74,8 @@ pub struct DlcParty {
     wallet: TaprootWallet,
     // Whether this party is the offerer or acceptor
     is_offerer: bool,
+    // Name for logging purposes
+    name: String,
 }
 
 #[derive(Debug)]
@@ -232,7 +234,7 @@ impl DlcParty {
     /// * `wallet` - The Taproot wallet to use for transactions
     /// * `is_offerer` - Whether this party is the offerer (true) or acceptor (false)
     #[instrument(skip_all, fields(is_offerer))]
-    pub fn new(wallet: TaprootWallet, is_offerer: bool) -> Self {
+    pub fn new(wallet: TaprootWallet, is_offerer: bool, name: String) -> Self {
         info!("Creating new DLC party");
         let secp = Secp256k1::new();
         let nonce_gen = Synthetic::<Sha256, GlobalRng<ThreadRng>>::default();
@@ -242,7 +244,7 @@ impl DlcParty {
         let funding_pubkey =
             XOnlyPublicKey::from_slice(&keypair.public_key().to_xonly_bytes()).unwrap();
 
-        debug!("Generated funding pubkey: {:?}", funding_pubkey);
+        debug!("{}: Generated funding pubkey: {:?}", name, funding_pubkey);
 
         Self {
             secp,
@@ -251,6 +253,7 @@ impl DlcParty {
             funding_pubkey,
             wallet,
             is_offerer,
+            name,
         }
     }
 
@@ -269,9 +272,9 @@ impl DlcParty {
         total_collateral: Amount,
         fee_rate: FeeRate,
     ) -> Result<DlcOffer, TaprootDlcError> {
-        info!("Creating new DLC offer");
+        info!("{}: Creating new DLC offer", self.name);
         let contract_id = new_temporary_id();
-        debug!("Generated contract ID: {:?}", contract_id);
+        debug!("{}: Generated contract ID: {:?}", self.name, contract_id);
 
         let funding_inputs = self
             .wallet
@@ -293,7 +296,11 @@ impl DlcParty {
             })
             .collect::<Vec<TxInputInfo>>();
 
-        debug!("Found {} funding inputs", funding_inputs.len());
+        debug!(
+            "{}: Found {} funding inputs",
+            self.name,
+            funding_inputs.len()
+        );
 
         // check for inputs
 
@@ -305,7 +312,7 @@ impl DlcParty {
             .script_pubkey();
 
         if !change_spk.is_p2tr() {
-            error!("Change script is not taproot");
+            error!("{}: Change script is not taproot", self.name);
             return Err(TaprootDlcError::NotTaproot);
         }
 
@@ -320,7 +327,7 @@ impl DlcParty {
             payout_serial_id: 0,
         };
 
-        info!("Successfully created DLC offer");
+        info!("{}: Successfully created DLC offer", self.name);
         Ok(DlcOffer {
             contract_id,
             offer_params,
@@ -336,9 +343,9 @@ impl DlcParty {
     /// * `offer` - The DLC offer to accept
     #[instrument(skip_all)]
     pub fn accept_dlc(&self, offer: DlcOffer) -> Result<DlcAccept, TaprootDlcError> {
-        info!("Accepting DLC offer");
+        info!("{}: Accepting DLC offer", self.name);
         let accept_collateral = offer.total_collateral - offer.offer_params.collateral;
-        debug!("Accept collateral: {}", accept_collateral);
+        debug!("{}: Accept collateral: {}", self.name, accept_collateral);
 
         let funding_inputs = self
             .wallet
@@ -360,7 +367,11 @@ impl DlcParty {
             })
             .collect::<Vec<TxInputInfo>>();
 
-        debug!("Found {} funding inputs", funding_inputs.len());
+        debug!(
+            "{}: Found {} funding inputs",
+            self.name,
+            funding_inputs.len()
+        );
 
         let payout_spk = self.wallet.get_new_address().unwrap().script_pubkey();
         let change_spk = self
@@ -387,7 +398,7 @@ impl DlcParty {
             offer.offer_params.collateral,
         )?;
 
-        debug!("Created funding transaction and script");
+        debug!("{}: Created funding transaction and script", self.name);
 
         let cet_adaptor_signatures = self.create_cet_adaptor_signatures(
             &offer.contract_info.contract_descriptor,
@@ -400,7 +411,7 @@ impl DlcParty {
             &funding_transaction,
         );
 
-        info!("Successfully created DLC acceptance");
+        info!("{}: Successfully created DLC acceptance", self.name);
         Ok(DlcAccept {
             contract_id: offer.contract_id,
             accept_params,
@@ -415,7 +426,7 @@ impl DlcParty {
     /// * `accept` - The DLC acceptance to sign
     #[instrument(skip_all)]
     pub fn sign_dlc(&self, accept: DlcAccept) -> Result<DlcSign, TaprootDlcError> {
-        info!("Signing DLC acceptance");
+        info!("{}: Signing DLC acceptance", self.name);
         let (funding_transaction, funding_script) = self.create_funding_transaction(
             &accept.offer.offer_params.fund_pubkey,
             &accept.accept_params.fund_pubkey,
@@ -423,7 +434,7 @@ impl DlcParty {
             accept.offer.offer_params.collateral,
         )?;
 
-        debug!("Created funding transaction and script");
+        debug!("{}: Created funding transaction and script", self.name);
 
         self.verify_adaptor_signatures(
             accept.accept_params.payout_spk.clone(),
@@ -438,7 +449,7 @@ impl DlcParty {
             &funding_transaction,
         )?;
 
-        debug!("Verified adaptor signatures");
+        debug!("{}: Verified adaptor signatures", self.name);
 
         let cet_adaptor_signatures = self.create_cet_adaptor_signatures(
             &accept.offer.contract_info.contract_descriptor.clone(),
@@ -446,12 +457,12 @@ impl DlcParty {
             accept.accept_params.payout_spk.clone(),
             accept.offer.offer_params.payout_spk.clone(),
             funding_script.as_script(),
-            1,
+            0,
             &funding_transaction.output[0],
             &funding_transaction,
         );
 
-        info!("Successfully signed DLC");
+        info!("{}: Successfully signed DLC", self.name);
         Ok(DlcSign {
             contract_id: accept.contract_id,
             cet_adaptor_signatures,
@@ -466,7 +477,10 @@ impl DlcParty {
     /// * `sign` - The DLC signing message
     #[instrument(skip_all)]
     pub fn verify_sign_and_broadcast(&self, _sign: DlcSign) -> Result<(), TaprootDlcError> {
-        info!("Verifying signatures and broadcasting transaction");
+        info!(
+            "{}: Verifying signatures and broadcasting transaction",
+            self.name
+        );
         Ok(())
     }
 
@@ -525,6 +539,23 @@ impl DlcParty {
                         let bytes = sighash.as_raw_hash().as_byte_array();
                         let message = Message::<Secret>::raw(bytes);
 
+                        debug!(
+                            "{}: Creating adaptor signature with funding script: {:?}",
+                            self.name,
+                            hex::encode(funding_script.as_bytes())
+                        );
+                        debug!("{}: CET txid: {:?}", self.name, cet.compute_txid());
+                        debug!(
+                            "{}: Sighash message bytes: {:?}",
+                            self.name,
+                            hex::encode(bytes)
+                        );
+                        debug!(
+                            "{}: Oracle point: {:?}",
+                            self.name,
+                            oracle_point.to_string()
+                        );
+
                         let encrypted_signature =
                             self.context
                                 .encrypted_sign(&self.keypair, &oracle_point, message);
@@ -534,7 +565,7 @@ impl DlcParty {
                     .collect()
             }
             ContractDescriptor::Numerical(_) => {
-                warn!("Numerical contracts not supported");
+                warn!("{}: Numerical contracts not supported", self.name);
                 vec![]
             }
         }
@@ -554,7 +585,10 @@ impl DlcParty {
         my_script_pubkey: ScriptBuf,
         funding_transaction: &Transaction,
     ) -> Transaction {
-        debug!("Building CET for outcome: {}", outcome.outcome);
+        debug!(
+            "{}: Building CET for outcome: {}",
+            self.name, outcome.outcome
+        );
         let input = vec![TxIn {
             previous_output: OutPoint {
                 txid: funding_transaction.compute_txid(),
@@ -566,22 +600,30 @@ impl DlcParty {
         }];
         let mut output = vec![];
 
-        let (offer_pubkey, accept_pubkey) = if self.is_offerer {
-            (my_script_pubkey, counterparty_script_pubkey)
-        } else {
-            (counterparty_script_pubkey, my_script_pubkey)
-        };
+        // let (offer_pubkey, accept_pubkey) = if self.is_offerer {
+        //     (my_script_pubkey, counterparty_script_pubkey)
+        // } else {
+        //     (counterparty_script_pubkey, my_script_pubkey)
+        // };
 
         if outcome.payout.offer > 0 {
             output.push(TxOut {
-                script_pubkey: offer_pubkey,
+                script_pubkey: if self.is_offerer {
+                    my_script_pubkey.clone()
+                } else {
+                    counterparty_script_pubkey.clone()
+                },
                 value: Amount::from_sat(outcome.payout.offer),
             });
         }
 
         if outcome.payout.accept > 0 {
             output.push(TxOut {
-                script_pubkey: accept_pubkey,
+                script_pubkey: if self.is_offerer {
+                    counterparty_script_pubkey.clone()
+                } else {
+                    my_script_pubkey.clone()
+                },
                 value: Amount::from_sat(outcome.payout.accept),
             });
         }
@@ -593,7 +635,7 @@ impl DlcParty {
             output,
         };
 
-        debug!("Built CET with {} outputs", tx.output.len());
+        debug!("{}: Built CET with {} outputs", self.name, tx.output.len());
         tx
     }
 
@@ -623,7 +665,7 @@ impl DlcParty {
         funding_output: &TxOut,
         funding_transaction: &Transaction,
     ) -> Result<(), TaprootDlcError> {
-        debug!("Verifying adaptor signatures");
+        debug!("{}: Verifying adaptor signatures", self.name);
         let payouts = match contract_descriptor {
             ContractDescriptor::Enum(e) => e.outcome_payouts.as_slice(),
             ContractDescriptor::Numerical(_) => {
@@ -661,13 +703,31 @@ impl DlcParty {
                     .unwrap()
             };
 
+            debug!(
+                "{}: Verifying with funding script: {:?}",
+                self.name,
+                hex::encode(funding_script.as_bytes())
+            );
+            debug!("{}: CET txid: {:?}", self.name, cet.compute_txid());
+            debug!(
+                "{}: Sighash message bytes: {:?}",
+                self.name,
+                hex::encode(bytes)
+            );
+            debug!(
+                "{}: Oracle point: {:?}",
+                self.name,
+                oracle_point.to_string()
+            );
+            debug!("{}: Verification key: {:?}", self.name, verify_key);
+
             if !self.context.verify_encrypted_signature(
                 &verify_key,
                 &oracle_point,
                 message,
                 signature,
             ) {
-                error!("Invalid adaptor signature");
+                error!("{}: Invalid adaptor signature", self.name);
                 return Err(TaprootDlcError::InvalidAdaptorSignature);
             }
         }
@@ -686,7 +746,7 @@ impl DlcParty {
         oracle_signature: Signature,
         encrypted_signature: EncryptedSignature,
     ) -> Signature {
-        debug!("Decrypting adaptor signature");
+        debug!("{}: Decrypting adaptor signature", self.name);
         let s = oracle_signature.s.non_zero().unwrap().secret();
         self.context.decrypt_signature(s, encrypted_signature)
     }
@@ -706,7 +766,7 @@ impl DlcParty {
         accept: Amount,
         offer: Amount,
     ) -> Result<(Transaction, ScriptBuf), TaprootDlcError> {
-        debug!("Creating funding transaction");
+        debug!("{}: Creating funding transaction", self.name);
         let funding_script = self.create_funding_script(offer_pubkey, accept_pubkey)?;
 
         let transaction = Transaction {
@@ -719,7 +779,11 @@ impl DlcParty {
             }],
         };
 
-        debug!("Created funding transaction with value: {}", accept + offer);
+        debug!(
+            "{}: Created funding transaction with value: {}",
+            self.name,
+            accept + offer
+        );
         Ok((transaction, funding_script))
     }
 
@@ -734,12 +798,19 @@ impl DlcParty {
         offer_pubkey: &XOnlyPublicKey,
         accept_pubkey: &XOnlyPublicKey,
     ) -> Result<ScriptBuf, TaprootDlcError> {
-        debug!("Creating funding script");
+        debug!("{}: Creating funding script", self.name);
         let (first_pubkey, second_pubkey) = if offer_pubkey < accept_pubkey {
             (offer_pubkey, accept_pubkey)
         } else {
             (accept_pubkey, offer_pubkey)
         };
+
+        debug!(
+            "{}: Creating funding script with pubkeys: {:?} and {:?}",
+            self.name,
+            hex::encode(first_pubkey.serialize()),
+            hex::encode(second_pubkey.serialize())
+        );
 
         let script_spend = Builder::new()
             .push_x_only_key(&first_pubkey)
@@ -752,12 +823,20 @@ impl DlcParty {
 
         let tap_tree = TapNodeHash::from_script(script_spend.as_script(), LeafVersion::TapScript);
 
+        let mut hasher = bitcoin::hashes::sha256::Hash::engine();
+        hasher.input(&first_pubkey.serialize());
+        hasher.input(&second_pubkey.serialize());
+        let seed_hash = bitcoin::hashes::sha256::Hash::from_engine(hasher);
+        let seed = seed_hash.as_byte_array();
         let internal_keypair = self
             .context
-            .new_keypair(Scalar::random(&mut rand::thread_rng()));
+            .new_keypair(Scalar::from_slice(&seed[..32]).unwrap());
         let internal_pubkey = internal_keypair.public_key().to_xonly_bytes();
 
-        debug!("Created funding script with tap tree");
+        debug!(
+            "Created funding script with tap tree: Internal pubkey: {:?}",
+            hex::encode(internal_pubkey)
+        );
         Ok(ScriptBuf::new_p2tr(
             &self.secp,
             XOnlyPublicKey::from_slice(&internal_pubkey).unwrap(),
@@ -786,7 +865,7 @@ impl DlcParty {
         encrypted_signature: EncryptedSignature,
         sign_dlc: DlcSign,
     ) -> Result<Transaction, TaprootDlcError> {
-        debug!("Spending CET");
+        debug!("{}: Spending CET", self.name);
         let my_sig = self
             .context
             .decrypt_signature(oracle_signature.s.non_zero().unwrap(), encrypted_signature);
@@ -822,7 +901,7 @@ impl DlcParty {
         witness.push(&control_block.serialize());
 
         cet.input[0].witness = witness;
-        debug!("Successfully spent CET");
+        debug!("{}: Successfully spent CET", self.name);
         Ok(cet.clone())
     }
 }
@@ -940,8 +1019,8 @@ mod tests {
     fn taproot_dlc() {
         let alice_wallet = TaprootWallet::wallet();
         let bob_wallet = TaprootWallet::wallet();
-        let alice = DlcParty::new(alice_wallet, true);
-        let bob = DlcParty::new(bob_wallet, false);
+        let alice = DlcParty::new(alice_wallet, true, "ALICE".to_string());
+        let bob = DlcParty::new(bob_wallet, false, "BOB".to_string());
 
         let offer_collateral = Amount::ONE_BTC;
         let total_collateral = Amount::ONE_BTC + Amount::ONE_BTC;

@@ -29,8 +29,8 @@ fn main() -> Result<(), TaprootDlcError> {
     bob_wallet.sync().unwrap();
     tracing::info!("Fauceted wallets: {:?}", alice_wallet.balance().unwrap());
     tracing::info!("Fauceted wallets: {:?}", bob_wallet.balance().unwrap());
-    let alice = DlcParty::new(alice_wallet, true);
-    let bob = DlcParty::new(bob_wallet, false);
+    let alice = DlcParty::new(alice_wallet, true, "ALICE".to_string());
+    let bob = DlcParty::new(bob_wallet, false, "BOB".to_string());
 
     let offer_collateral = Amount::ONE_BTC;
     let total_collateral = Amount::ONE_BTC + Amount::ONE_BTC;
