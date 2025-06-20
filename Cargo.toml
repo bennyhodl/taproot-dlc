@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bdk_wallet = "=1.0.0-beta.5"
+bdk_wallet = "1.0.0"
 bitcoin = "0.32.5"
 dlc = "0.7.1"
 dlc-trie = "0.7.1"
@@ -18,5 +18,16 @@ serde_json = "1.0.133"
 sha2 = "0.10.8"
 thiserror = "2.0.8"
 dlc-messages = "0.7.1"
-ddk-manager = "0.7.2"
-ddk = "0.0.13"
+ddk-manager = "0.7.3"
+ddk = "0.0.14"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+bitcoincore-rpc-json = "0.19.0"
+bitcoincore-rpc = "0.19.0"
+bdk_esplora = "0.20.1"
+anyhow = "1.0.98"
+tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }
+
+[[bin]]
+name = "taproot-dlc"
+path = "bin/main.rs"
