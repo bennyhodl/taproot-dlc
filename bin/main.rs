@@ -65,7 +65,7 @@ async fn main() -> Result<(), TaprootDlcError> {
         e
     })?;
 
-    let funding_transaction = alice.verify_sign_and_broadcast(signed).await.map_err(|e| {
+    let funding_transaction = bob.verify_sign_and_broadcast(signed).await.map_err(|e| {
         tracing::error!("Error verifying and broadcasting DLC: {:?}", e);
         e
     })?;
@@ -120,20 +120,26 @@ fn fund_wallets(
 ) -> Result<(), TaprootDlcError> {
     alice_wallet.faucet(Some(Amount::ONE_BTC), &client).unwrap();
     bob_wallet.faucet(Some(Amount::ONE_BTC), &client).unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    tracing::info!("Waiting for transactions to be mined...");
+    std::thread::sleep(std::time::Duration::from_secs(10));
+
+    tracing::info!("Syncing Alice wallet...");
     alice_wallet.sync().unwrap();
+    tracing::info!("Syncing Bob wallet...");
     bob_wallet.sync().unwrap();
-    tracing::info!(
-        "Fauceted wallets: {:?}",
-        alice_wallet.balance().unwrap().confirmed
-    );
-    tracing::info!(
-        "Fauceted wallets: {:?}",
-        bob_wallet.balance().unwrap().confirmed
-    );
-    if alice_wallet.balance().unwrap().confirmed < Amount::ONE_BTC
-        || bob_wallet.balance().unwrap().confirmed < Amount::ONE_BTC
-    {
+
+    let alice_balance = alice_wallet.balance().unwrap().confirmed;
+    let bob_balance = bob_wallet.balance().unwrap().confirmed;
+
+    tracing::info!("Alice balance: {:?}", alice_balance);
+    tracing::info!("Bob balance: {:?}", bob_balance);
+
+    if alice_balance < Amount::ONE_BTC || bob_balance < Amount::ONE_BTC {
+        tracing::error!(
+            "Alice balance: {}, Bob balance: {}",
+            alice_balance,
+            bob_balance
+        );
         tracing::error!("Alice or Bob does not have enough balance");
         return Err(TaprootDlcError::General(
             "Alice or Bob does not have enough balance".to_string(),

@@ -287,6 +287,16 @@ pub struct DlcAccept {
     offer: DlcOffer,
 }
 
+#[derive(Debug, Clone)]
+pub struct WitnessElement {
+    pub witness: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FundingSignature {
+    pub witness_elements: Vec<WitnessElement>,
+}
+
 #[derive(Debug)]
 pub struct DlcSign {
     contract_id: [u8; 32],
@@ -294,6 +304,8 @@ pub struct DlcSign {
     cet_adaptor_signatures: Vec<EncryptedSignature>,
 
     pub funding_transaction: Transaction,
+    // Funding signatures from the signer (witness data for their inputs)
+    pub funding_signatures: Vec<FundingSignature>,
 
     // Refund signature
     // refund_signature: Signature,
@@ -375,8 +387,8 @@ impl<B: Blockchain> DlcParty<B> {
             prev_tx.consensus_encode(&mut writer).unwrap();
             let prev_tx_vout = utxo.outpoint.vout;
             let sequence = 0xffffffff;
-            // TODO(tibo): this assumes P2WPKH with low R
-            let max_witness_len = 107;
+            // P2TR key-spend witness: signature (64 bytes) + sighash_type (1 byte) = 65 bytes
+            let max_witness_len = 65;
             let funding_input = FundingInput {
                 input_serial_id: thread_rng().next_u64(),
                 prev_tx: writer,
@@ -468,8 +480,8 @@ impl<B: Blockchain> DlcParty<B> {
             prev_tx.consensus_encode(&mut writer).unwrap();
             let prev_tx_vout = utxo.outpoint.vout;
             let sequence = 0xffffffff;
-            // TODO(tibo): this assumes P2WPKH with low R
-            let max_witness_len = 107;
+            // P2TR key-spend witness: signature (64 bytes) + sighash_type (1 byte) = 65 bytes
+            let max_witness_len = 65;
             let funding_input = FundingInput {
                 input_serial_id: thread_rng().next_u64(),
                 prev_tx: writer,
@@ -591,15 +603,20 @@ impl<B: Blockchain> DlcParty<B> {
         let mut all_funding_inputs: Vec<&FundingInput> = Vec::new();
         all_funding_inputs.extend(&accept.offer.offer_params.funding_inputs);
         all_funding_inputs.extend(&accept.accept_params.funding_inputs);
+        // Sort by serial ID to match rust-dlc pattern and ensure consistent ordering
+        all_funding_inputs.sort_by_key(|x| x.input_serial_id);
 
-        self.wallet
-            .sign_funding_inputs(&mut funding_transaction, &all_funding_inputs)?;
+        // Sign and extract funding signatures, keeping transaction unsigned
+        let funding_signatures = self
+            .wallet
+            .sign_and_extract_funding_signatures(&funding_transaction, &all_funding_inputs)?;
         info!("{}: Successfully signed funding transaction", self.name);
 
         Ok(DlcSign {
             contract_id: accept.contract_id,
             cet_adaptor_signatures,
-            funding_transaction,
+            funding_transaction, // Keep this unsigned
+            funding_signatures,
             accept,
         })
     }
@@ -618,18 +635,72 @@ impl<B: Blockchain> DlcParty<B> {
             self.name
         );
 
-        let mut funding_transaction = sign.funding_transaction.clone();
+        // Create PSBT from the unsigned transaction
+        let mut fund_psbt = Psbt::from_unsigned_tx(sign.funding_transaction.clone())
+            .map_err(|e| TaprootDlcError::General(format!("Error creating psbt: {}", e)))?;
 
+        // Get all funding inputs sorted by serial ID (to match rust-dlc pattern)
         let mut all_funding_inputs: Vec<&FundingInput> = Vec::new();
         all_funding_inputs.extend(&sign.accept.offer.offer_params.funding_inputs);
         all_funding_inputs.extend(&sign.accept.accept_params.funding_inputs);
+        all_funding_inputs.sort_by_key(|x| x.input_serial_id);
 
-        self.wallet
-            .sign_funding_inputs(&mut funding_transaction, &all_funding_inputs)?;
-        info!("{}: Successfully signed funding transaction", self.name);
+        populate_psbt(&mut fund_psbt, &all_funding_inputs)?;
 
-        debug!("{}: Verified adaptor signatures", self.name);
-        Ok(funding_transaction)
+        // Apply the funding signatures from the other party (Alice's signatures)
+        for (funding_input, funding_signature) in sign
+            .accept
+            .offer
+            .offer_params
+            .funding_inputs
+            .iter()
+            .zip(sign.funding_signatures.iter())
+        {
+            let input_index = all_funding_inputs
+                .iter()
+                .position(|x| x == &funding_input)
+                .ok_or_else(|| {
+                    TaprootDlcError::General(format!(
+                        "Could not find input for serial id {}",
+                        funding_input.input_serial_id
+                    ))
+                })?;
+
+            fund_psbt.inputs[input_index].final_script_witness = Some(Witness::from_slice(
+                &funding_signature
+                    .witness_elements
+                    .iter()
+                    .map(|x| x.witness.clone())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+
+        // Sign our own inputs (Bob's inputs)
+        for funding_input in &sign.accept.accept_params.funding_inputs {
+            let input_index = all_funding_inputs
+                .iter()
+                .position(|x| x == &funding_input)
+                .ok_or_else(|| {
+                    TaprootDlcError::General(format!(
+                        "Could not find input for serial id {}",
+                        funding_input.input_serial_id
+                    ))
+                })?;
+
+            self.wallet
+                .sign_psbt_input(&mut fund_psbt, input_index)
+                .map_err(|e| TaprootDlcError::General(e.to_string()))?;
+        }
+
+        let final_transaction = fund_psbt.extract_tx().map_err(|e| {
+            TaprootDlcError::General(format!("Error extracting transaction: {}", e))
+        })?;
+
+        info!(
+            "{}: Successfully created fully signed funding transaction",
+            self.name
+        );
+        Ok(final_transaction)
     }
 
     /// Creates adaptor signatures for CET (Contract Execution Transaction)
@@ -1196,6 +1267,7 @@ pub fn populate_psbt(
 mod tests {
     use super::*;
     use bitcoin::Network;
+    use bitcoincore_rpc::{Auth, Client, RpcApi};
     use ddk::chain::EsploraClient;
     use ddk_manager::contract::enum_descriptor::EnumDescriptor;
     use dlc::Payout;
@@ -1228,17 +1300,26 @@ mod tests {
 
     #[tokio::test]
     async fn taproot_dlc() {
+        let client = Client::new(
+            "http://localhost:18443",
+            Auth::UserPass("ddk".to_string(), "ddk".to_string()),
+        )
+        .unwrap();
         let alice_wallet = TaprootWallet::wallet();
         let bob_wallet = TaprootWallet::wallet();
+
+        fund_wallets(&alice_wallet, &bob_wallet, &client).expect("Error funding wallets");
+
         let alice_blockchain =
             EsploraClient::new("http://localhost:30000", Network::Regtest).unwrap();
         let bob_blockchain =
             EsploraClient::new("http://localhost:30000", Network::Regtest).unwrap();
+
         let alice = DlcParty::new(alice_wallet, alice_blockchain, true, "ALICE".to_string());
         let bob = DlcParty::new(bob_wallet, bob_blockchain, false, "BOB".to_string());
 
-        let offer_collateral = Amount::ONE_BTC;
-        let total_collateral = Amount::ONE_BTC + Amount::ONE_BTC;
+        let offer_collateral = Amount::from_btc(0.5).unwrap();
+        let total_collateral = Amount::ONE_BTC;
 
         let contract_info = ContractInfo {
             contract_descriptor: contract_descriptor(),
@@ -1253,14 +1334,56 @@ mod tests {
                 FeeRate::from_sat_per_vb_unchecked(1),
             )
             .await
-            .unwrap();
+            .expect("Error offering DLC");
 
-        let accept = bob.accept_dlc(offer).await.unwrap();
+        let accept = bob.accept_dlc(offer).await.expect("Error accepting DLC");
 
-        let signed = alice.sign_dlc(accept).await.unwrap();
+        let signed = alice.sign_dlc(accept).await.expect("Error signing DLC");
 
-        let tx_hex = hex::encode(&signed.funding_transaction.serialize().unwrap());
-        println!("{}", tx_hex);
+        let funding_transaction = bob
+            .verify_sign_and_broadcast(signed)
+            .await
+            .expect("Error verifying and broadcasting DLC");
+
+        let broadcast = client
+            .send_raw_transaction(&funding_transaction)
+            .expect("Error broadcasting DLC");
+    }
+
+    fn fund_wallets(
+        alice_wallet: &TaprootWallet,
+        bob_wallet: &TaprootWallet,
+        client: &Client,
+    ) -> Result<(), TaprootDlcError> {
+        alice_wallet.faucet(Some(Amount::ONE_BTC), &client).unwrap();
+        bob_wallet.faucet(Some(Amount::ONE_BTC), &client).unwrap();
+        tracing::info!("Waiting for transactions to be mined...");
+        std::thread::sleep(std::time::Duration::from_secs(10));
+
+        tracing::info!("Syncing Alice wallet...");
+        alice_wallet.sync().unwrap();
+        tracing::info!("Syncing Bob wallet...");
+        bob_wallet.sync().unwrap();
+
+        let alice_balance = alice_wallet.balance().unwrap().confirmed;
+        let bob_balance = bob_wallet.balance().unwrap().confirmed;
+
+        tracing::info!("Alice balance: {:?}", alice_balance);
+        tracing::info!("Bob balance: {:?}", bob_balance);
+
+        if alice_balance < Amount::ONE_BTC || bob_balance < Amount::ONE_BTC {
+            tracing::error!(
+                "Alice balance: {}, Bob balance: {}",
+                alice_balance,
+                bob_balance
+            );
+            tracing::error!("Alice or Bob does not have enough balance");
+            return Err(TaprootDlcError::General(
+                "Alice or Bob does not have enough balance".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
