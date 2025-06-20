@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 use bdk_esplora::esplora_client::blocking::BlockingClient;
@@ -6,15 +6,18 @@ use bdk_esplora::esplora_client::Builder;
 use bdk_esplora::EsploraExt;
 use bdk_wallet::descriptor::IntoWalletDescriptor;
 use bdk_wallet::template::Bip86;
-use bdk_wallet::{Balance, KeychainKind, SignOptions, Update, Wallet as BdkWallet};
+use bdk_wallet::{Balance, KeychainKind, SignOptions, Update, Utxo, Wallet as BdkWallet};
 use bitcoin::bip32::Xpriv;
 use bitcoin::secp256k1::Secp256k1;
-use bitcoin::{Address, Amount, Network, ScriptBuf};
+use bitcoin::{Address, Amount, Network, OutPoint, Psbt, ScriptBuf, Transaction};
 use bitcoincore_rpc::{Client, RpcApi};
 use ddk::storage::memory::MemoryStorage;
 use ddk_manager::error::Error;
-use ddk_manager::Wallet;
+use ddk_manager::{Blockchain, Wallet};
 use rand::Fill;
+use tracing::{debug, error};
+
+use crate::{populate_psbt, FundingInput, TaprootDlcError};
 
 pub struct TaprootWallet {
     pub wallet: RwLock<BdkWallet>,
@@ -103,6 +106,72 @@ impl TaprootWallet {
             .unwrap();
         Ok(())
     }
+
+    pub fn sign_funding_inputs(
+        &self,
+        transaction: &mut Transaction,
+        all_funding_inputs: &[&FundingInput],
+    ) -> Result<(), TaprootDlcError> {
+        let mut psbt = Psbt::from_unsigned_tx(transaction.clone())
+            .map_err(|e| TaprootDlcError::General(format!("Error creating psbt: {}", e)))?;
+
+        populate_psbt(&mut psbt, all_funding_inputs)?;
+
+        let mut wallet = self.wallet.try_write().unwrap();
+
+        // Debug: Check what UTXOs we have
+        debug!("Available UTXOs in wallet:");
+        for utxo in wallet.list_unspent() {
+            debug!("  UTXO: {} - {}", utxo.outpoint, utxo.txout.value);
+        }
+
+        debug!("Transaction inputs to sign:");
+        for (i, input) in transaction.input.iter().enumerate() {
+            debug!("  Input {}: {}", i, input.previous_output);
+
+            if let Some(utxo) = wallet.get_utxo(input.previous_output) {
+                debug!("    Found UTXO: {} sats", utxo.txout.value);
+                psbt.inputs[i].witness_utxo = Some(utxo.txout.clone());
+            } else {
+                debug!("    UTXO not found in wallet (probably belongs to other party)");
+            }
+        }
+
+        let sign_options = SignOptions {
+            trust_witness_utxo: true,
+            allow_grinding: true,
+            try_finalize: true,
+            ..Default::default()
+        };
+
+        // Try to sign
+        match wallet.sign(&mut psbt, sign_options) {
+            Ok(_) => {
+                debug!("Successfully signed PSBT");
+                *transaction = psbt.extract_tx().map_err(|e| {
+                    TaprootDlcError::General(format!("Error extracting funding transaction: {}", e))
+                })?;
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to sign PSBT: {}", e);
+
+                // Debug: Check which inputs have witness UTXOs
+                for (i, input) in psbt.inputs.iter().enumerate() {
+                    if input.witness_utxo.is_some() {
+                        debug!("  Input {} has witness_utxo", i);
+                    } else {
+                        debug!("  Input {} missing witness_utxo", i);
+                    }
+                }
+
+                Err(TaprootDlcError::General(format!(
+                    "Error signing funding inputs: {}",
+                    e
+                )))
+            }
+        }
+    }
 }
 
 impl Wallet for TaprootWallet {
@@ -132,7 +201,7 @@ impl Wallet for TaprootWallet {
                     tx_out: utxo.txout.clone(),
                     outpoint: utxo.outpoint,
                     address,
-                    redeem_script: ScriptBuf::new(),
+                    redeem_script: utxo.txout.script_pubkey,
                     reserved: false,
                 }
             })
@@ -144,19 +213,9 @@ impl Wallet for TaprootWallet {
     }
 
     fn sign_psbt_input(&self, psbt: &mut bitcoin::Psbt, input_index: usize) -> Result<(), Error> {
-        let mut wallet = self.wallet.try_write().unwrap();
-        let sign_opts = SignOptions {
-            trust_witness_utxo: true,
-            ..Default::default()
-        };
-
-        let mut signed_psbt = psbt.clone();
-        wallet
-            .sign(&mut signed_psbt, sign_opts)
-            .expect("could not sign psbt");
-
-        psbt.inputs[input_index] = signed_psbt.inputs[input_index].clone();
-
+        let mut transaction = psbt.clone().extract_tx().unwrap();
+        self.sign_funding_inputs(&mut transaction, &[]).unwrap();
+        *psbt = Psbt::from_unsigned_tx(transaction).unwrap();
         Ok(())
     }
 

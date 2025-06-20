@@ -31,7 +31,7 @@ pub const TX_VERSION: Version = Version::TWO;
 
 /// The base weight of a fund transaction
 /// See: https://github.com/discreetlogcontracts/dlcspecs/blob/master/Transactions.md#fees
-pub const FUND_TX_BASE_WEIGHT: usize = 214;
+pub const FUND_TX_BASE_WEIGHT: usize = 230;
 
 /// The weight of a CET excluding payout outputs
 /// See: https://github.com/discreetlogcontracts/dlcspecs/blob/master/Transactions.md#fees
@@ -44,6 +44,8 @@ pub const TX_INPUT_BASE_WEIGHT: usize = 164;
 /// The witness size of a P2WPKH input
 /// See: <https://github.com/discreetlogcontracts/dlcspecs/blob/master/Transactions.md#fees>
 pub const P2WPKH_WITNESS_SIZE: usize = 107;
+
+pub const TAPROOT_WITNESS_SIZE: usize = 230;
 
 #[macro_export]
 macro_rules! checked_add {
@@ -152,9 +154,9 @@ pub(crate) fn create_fund_transaction_with_fees(
     let fund_tx = create_funding_transaction(
         &funding_script_pubkey,
         fund_output_value,
-        &offer_tx_ins,
+        &offer_tx_ins.as_slice(),
         &offer_inputs_serial_ids,
-        &accept_tx_ins,
+        &accept_tx_ins.as_slice(),
         &accept_inputs_serial_ids,
         offer_change_output,
         offer_params.change_serial_id,
