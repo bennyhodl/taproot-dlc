@@ -1,0 +1,67 @@
+services:
+  bitcoin:
+    image: bitcoin/bitcoin:28.0
+    container_name: bitcoin
+    command: |
+      -regtest=1
+      -rpcuser=ddk
+      -rpcpassword=ddk
+      -rpcallowip=0.0.0.0/0
+      -rpcbind=0.0.0.0
+      -server=1
+      -addresstype=bech32
+      -fallbackfee=0.0002
+      -txindex=1
+      -zmqpubrawblock=tcp://0.0.0.0:28332
+      -zmqpubrawtx=tcp://0.0.0.0:28333
+      -printtoconsole
+      -regtest
+      -disablewallet=0
+    ports:
+      # regtest ports
+      - 18443:18443
+    volumes:
+      - bitcoin-data:/bitcoin/.bitcoin
+    networks:
+      - bitcoin-network
+  electrs:
+    image: ghcr.io/vulpemventures/electrs:latest
+    container_name: electrs
+    entrypoint:
+      - /build/electrs
+    command:
+      - -vvvv
+      - --network
+      - regtest
+      - --daemon-dir
+      - /config
+      - --daemon-rpc-addr
+      - bitcoin:18443
+      - --cookie
+      - ddk:ddk
+      - --http-addr
+      - 0.0.0.0:30000
+      - --electrum-rpc-addr
+      - 0.0.0.0:50000
+      - --cors
+      - "*"
+      - --jsonrpc-import
+    depends_on:
+      - bitcoin
+    ports:
+      - 50000:50000
+      - 30000:30000
+    expose:
+      - "30000"
+      - "50000"
+    volumes:
+      - bitcoin-data:/config
+    restart: unless-stopped
+    networks:
+      - bitcoin-network
+volumes:
+  bitcoin-data:
+
+networks:
+  bitcoin-network:
+    driver: bridge
