@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 use bdk_esplora::esplora_client::blocking::BlockingClient;
@@ -6,14 +6,13 @@ use bdk_esplora::esplora_client::Builder;
 use bdk_esplora::EsploraExt;
 use bdk_wallet::descriptor::IntoWalletDescriptor;
 use bdk_wallet::template::Bip86;
-use bdk_wallet::{Balance, KeychainKind, SignOptions, Update, Utxo, Wallet as BdkWallet};
+use bdk_wallet::{Balance, KeychainKind, SignOptions, Update, Wallet as BdkWallet};
 use bitcoin::bip32::Xpriv;
 use bitcoin::secp256k1::Secp256k1;
-use bitcoin::{Address, Amount, Network, OutPoint, Psbt, ScriptBuf, Transaction};
+use bitcoin::{Address, Amount, Network, Psbt, Transaction};
 use bitcoincore_rpc::{Client, RpcApi};
-use ddk::storage::memory::MemoryStorage;
 use ddk_manager::error::Error;
-use ddk_manager::{Blockchain, Wallet};
+use ddk_manager::Wallet;
 use hex;
 use rand::Fill;
 use tracing::{debug, error};
@@ -22,7 +21,6 @@ use crate::{populate_psbt, FundingInput, FundingSignature, TaprootDlcError, Witn
 
 pub struct TaprootWallet {
     pub wallet: RwLock<BdkWallet>,
-    storage: MemoryStorage,
     blockchain: BlockingClient,
 }
 
@@ -52,13 +50,12 @@ impl TaprootWallet {
 
         Self {
             wallet: RwLock::new(wallet),
-            storage: MemoryStorage::new(),
             blockchain,
         }
     }
 
     pub fn balance(&self) -> Result<Balance, Error> {
-        let mut wallet = self.wallet.try_read().unwrap();
+        let wallet = self.wallet.try_read().unwrap();
         Ok(wallet.balance())
     }
 
@@ -114,14 +111,14 @@ impl TaprootWallet {
         all_funding_inputs: &[&FundingInput],
     ) -> Result<Vec<FundingSignature>, TaprootDlcError> {
         // Create a mutable copy for signing
-        let mut signing_transaction = transaction.clone();
+        let signing_transaction = transaction.clone();
 
         let mut psbt = Psbt::from_unsigned_tx(signing_transaction.clone())
             .map_err(|e| TaprootDlcError::General(format!("Error creating psbt: {}", e)))?;
 
         populate_psbt(&mut psbt, all_funding_inputs)?;
 
-        let mut wallet = self.wallet.try_write().unwrap();
+        let wallet = self.wallet.try_write().unwrap();
 
         let sign_options = SignOptions {
             trust_witness_utxo: true,
@@ -212,11 +209,11 @@ impl Wallet for TaprootWallet {
 
     fn get_utxos_for_amount(
         &self,
-        amount: u64,
-        fee_rate: u64,
-        lock_utxos: bool,
+        _amount: u64,
+        _fee_rate: u64,
+        _lock_utxos: bool,
     ) -> Result<Vec<ddk_manager::Utxo>, Error> {
-        let mut wallet = self.wallet.try_write().unwrap();
+        let wallet = self.wallet.try_write().unwrap();
         Ok(wallet
             .list_unspent()
             .map(|utxo| {
@@ -233,12 +230,12 @@ impl Wallet for TaprootWallet {
             .collect())
     }
 
-    fn import_address(&self, address: &bitcoin::Address) -> Result<(), Error> {
+    fn import_address(&self, _address: &bitcoin::Address) -> Result<(), Error> {
         unimplemented!("No importing addresses for bdk_wallet")
     }
 
-    fn sign_psbt_input(&self, psbt: &mut bitcoin::Psbt, input_index: usize) -> Result<(), Error> {
-        let mut wallet = self.wallet.try_write().unwrap();
+    fn sign_psbt_input(&self, psbt: &mut bitcoin::Psbt, _input_index: usize) -> Result<(), Error> {
+        let wallet = self.wallet.try_write().unwrap();
 
         let sign_options = SignOptions {
             trust_witness_utxo: true,
@@ -254,7 +251,7 @@ impl Wallet for TaprootWallet {
         Ok(())
     }
 
-    fn unreserve_utxos(&self, outpoints: &[bitcoin::OutPoint]) -> Result<(), Error> {
+    fn unreserve_utxos(&self, _outpoints: &[bitcoin::OutPoint]) -> Result<(), Error> {
         unimplemented!("not needed for bdk_wallet")
     }
 }

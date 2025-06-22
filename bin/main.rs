@@ -1,12 +1,12 @@
 use bitcoin::{Amount, FeeRate, Network};
 use bitcoincore_rpc::{Auth, Client, RpcApi};
-use ddk::chain::EsploraClient;
+use ddk::{chain::EsploraClient, oracle::memory::MemoryOracle};
 use ddk_manager::contract::{
     contract_info::ContractInfo, enum_descriptor::EnumDescriptor, ser::Serializable,
     ContractDescriptor,
 };
 use dlc::{EnumerationPayout, Payout};
-use kormir::OracleAnnouncement;
+use kormir::{storage::MemoryStorage, Oracle, OracleAnnouncement, OracleAttestation};
 use taproot_dlc::{wallet::TaprootWallet, DlcParty, TaprootDlcError};
 use tracing::Level;
 use tracing_subscriber::fmt::Subscriber;
@@ -37,9 +37,11 @@ async fn main() -> Result<(), TaprootDlcError> {
     let offer_collateral = Amount::from_btc(0.5).unwrap();
     let total_collateral = Amount::ONE_BTC;
 
+    let oracle = oracle();
+
     let contract_info = ContractInfo {
         contract_descriptor: contract_descriptor(),
-        oracle_announcements: vec![announcement()],
+        oracle_announcements: vec![announcement(&oracle).await],
         threshold: 1,
     };
     let offer = alice
@@ -60,7 +62,7 @@ async fn main() -> Result<(), TaprootDlcError> {
         e
     })?;
 
-    let signed = alice.sign_dlc(accept).await.map_err(|e| {
+    let signed = alice.sign_dlc(accept).map_err(|e| {
         tracing::error!("Error signing DLC: {:?}", e);
         e
     })?;
@@ -84,11 +86,9 @@ async fn main() -> Result<(), TaprootDlcError> {
 
     tracing::info!("Broadcasted DLC: {:?}", broadcast);
 
-    Ok(())
-}
+    let _attestation = oracle_attestation(&oracle, "taproot-dlc", "OP_CTV").await;
 
-fn announcement() -> OracleAnnouncement {
-    serde_json::from_str::<OracleAnnouncement>(include_str!("../announcement.json")).unwrap()
+    Ok(())
 }
 
 fn contract_descriptor() -> ContractDescriptor {
@@ -111,6 +111,40 @@ fn contract_descriptor() -> ContractDescriptor {
         ],
     };
     ContractDescriptor::Enum(enumeration_descriptor)
+}
+
+fn oracle() -> MemoryOracle {
+    MemoryOracle::default()
+}
+
+async fn announcement(oracle: &MemoryOracle) -> OracleAnnouncement {
+    let announcement = oracle
+        .oracle
+        .create_enum_event(
+            "taproot-dlc".to_string(),
+            vec!["OP_CAT".to_string(), "OP_CTV".to_string()],
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as u32,
+        )
+        .await
+        .unwrap();
+    tracing::info!("Announcement: {:?}", announcement);
+    announcement
+}
+
+async fn oracle_attestation(
+    oracle: &MemoryOracle,
+    event_id: &str,
+    outcome: &str,
+) -> OracleAttestation {
+    let attestation = oracle
+        .oracle
+        .sign_enum_event(event_id.to_string(), outcome.to_string())
+        .await
+        .unwrap();
+    attestation
 }
 
 fn fund_wallets(

@@ -1,4 +1,4 @@
-#![allow(dead_code, unused)]
+// #![allow(dead_code, unused)]
 mod util;
 pub mod wallet;
 
@@ -15,9 +15,7 @@ use bitcoin::{
     Amount, FeeRate, OutPoint, Psbt, Script, ScriptBuf, Sequence, TapLeafHash, TapNodeHash,
     TapSighash, TapSighashType, Transaction, TxIn, TxOut, Witness, XOnlyPublicKey,
 };
-use ddk::chain::EsploraClient;
 use ddk_manager::contract::contract_info::ContractInfo;
-use ddk_manager::contract::ser::Serializable;
 use ddk_manager::contract::ContractDescriptor;
 use ddk_manager::{Blockchain, Wallet};
 use dlc::secp256k1_zkp::{All, Secp256k1};
@@ -513,18 +511,16 @@ impl<B: Blockchain> DlcParty<B> {
 
         debug!("{}: Created funding transaction and script", self.name);
 
-        let cet_adaptor_signatures = self
-            .create_cet_adaptor_signatures(
-                &offer.contract_info.contract_descriptor,
-                &offer.contract_info.oracle_announcements[0],
-                offer.offer_params.payout_spk.clone(),
-                accept_params.payout_spk.clone(),
-                &funding_script.as_script(),
-                0,
-                &funding_transaction.output[0],
-                &funding_transaction,
-            )
-            .await;
+        let cet_adaptor_signatures = self.create_cet_adaptor_signatures(
+            &offer.contract_info.contract_descriptor,
+            &offer.contract_info.oracle_announcements[0],
+            offer.offer_params.payout_spk.clone(),
+            accept_params.payout_spk.clone(),
+            &funding_script.as_script(),
+            0,
+            &funding_transaction.output[0],
+            &funding_transaction,
+        );
 
         info!("{}: Successfully created DLC acceptance", self.name);
         Ok(DlcAccept {
@@ -540,9 +536,9 @@ impl<B: Blockchain> DlcParty<B> {
     /// # Arguments
     /// * `accept` - The DLC acceptance to sign
     #[instrument(skip_all)]
-    pub async fn sign_dlc(&self, accept: DlcAccept) -> Result<DlcSign, TaprootDlcError> {
+    pub fn sign_dlc(&self, accept: DlcAccept) -> Result<DlcSign, TaprootDlcError> {
         info!("{}: Signing DLC acceptance", self.name);
-        let (mut funding_transaction, funding_script) = self.create_funding_transaction(
+        let (funding_transaction, funding_script) = self.create_funding_transaction(
             &accept.offer.offer_params,
             &accept.accept_params,
             accept.offer.fee_rate.to_sat_per_vb_ceil(),
@@ -561,23 +557,20 @@ impl<B: Blockchain> DlcParty<B> {
             0,
             &funding_transaction.output[0],
             &funding_transaction,
-        )
-        .await?;
+        )?;
 
         debug!("{}: Verified adaptor signatures", self.name);
 
-        let cet_adaptor_signatures = self
-            .create_cet_adaptor_signatures(
-                &accept.offer.contract_info.contract_descriptor.clone(),
-                &accept.offer.contract_info.oracle_announcements[0],
-                accept.accept_params.payout_spk.clone(),
-                accept.offer.offer_params.payout_spk.clone(),
-                funding_script.as_script(),
-                0,
-                &funding_transaction.output[0],
-                &funding_transaction,
-            )
-            .await;
+        let cet_adaptor_signatures = self.create_cet_adaptor_signatures(
+            &accept.offer.contract_info.contract_descriptor.clone(),
+            &accept.offer.contract_info.oracle_announcements[0],
+            accept.accept_params.payout_spk.clone(),
+            accept.offer.offer_params.payout_spk.clone(),
+            funding_script.as_script(),
+            0,
+            &funding_transaction.output[0],
+            &funding_transaction,
+        );
 
         info!(
             "{}: Successfully created adaptor signatures in sign_dlc",
@@ -698,7 +691,7 @@ impl<B: Blockchain> DlcParty<B> {
     /// * `input_index` - The input index
     /// * `funding_output` - The funding output
     #[instrument(skip_all)]
-    async fn create_cet_adaptor_signatures(
+    fn create_cet_adaptor_signatures(
         &self,
         contract_descriptor: &ContractDescriptor,
         announcement: &OracleAnnouncement,
@@ -713,7 +706,17 @@ impl<B: Blockchain> DlcParty<B> {
             ContractDescriptor::Enum(enumeration) => {
                 debug!("Creating adaptor signatures for enumeration contract");
                 let mut sigs = Vec::new();
-                for (i, outcome) in enumeration.outcome_payouts.iter().enumerate() {
+
+                // For enumeration contracts, there should be only one nonce
+                if announcement.oracle_event.oracle_nonces.is_empty() {
+                    error!("No oracle nonces found in announcement");
+                    return sigs;
+                }
+
+                let nonce = &announcement.oracle_event.oracle_nonces[0]; // Use the single nonce
+                let base_oracle_point = convert_xonly_to_normal_point(nonce);
+
+                for outcome in enumeration.outcome_payouts.iter() {
                     if counterparty_script_pubkey == payout_script_pubkey {
                         error!("Counterparty pubkey is same as self pubkey!");
                         panic!("Counterparty pubkey is same as self pubkey!");
@@ -725,25 +728,41 @@ impl<B: Blockchain> DlcParty<B> {
                         funding_transaction,
                     );
 
-                    let nonce = announcement.oracle_event.oracle_nonces[i].clone();
-                    let oracle_point = convert_xonly_to_normal_point(&nonce);
+                    // Create oracle signature point for this specific outcome
+                    let outcome_hash =
+                        bitcoin::hashes::sha256::Hash::hash(outcome.outcome.as_bytes());
+                    let outcome_message =
+                        secp256k1_zkp::Message::from_digest(outcome_hash.to_byte_array());
 
-                    let sighash = create_sighash_msg(
+                    // Compute the oracle signature point for this outcome
+                    // This represents the point that the oracle would use when signing this outcome
+                    let oracle_sig_point = dlc::secp_utils::schnorrsig_compute_sig_point(
                         &self.secp,
-                        &self.keypair,
-                        &cet,
-                        funding_script,
-                        input_index,
-                        funding_output,
-                        &self.blockchain,
+                        &announcement.oracle_public_key,
+                        nonce,
+                        &outcome_message,
                     )
-                    .await;
+                    .unwrap_or_else(|e| {
+                        error!("Failed to compute oracle signature point: {}", e);
+                        panic!("Failed to compute oracle signature point");
+                    });
+
+                    let oracle_point =
+                        Point::<Normal, Public, NonZero>::from_bytes(oracle_sig_point.serialize())
+                            .unwrap_or_else(|| {
+                                error!("Failed to convert oracle signature point");
+                                panic!("Failed to convert oracle signature point");
+                            });
+
+                    let sighash =
+                        create_sighash_msg(&cet, funding_script, input_index, funding_output);
                     let bytes = sighash.as_raw_hash().as_byte_array();
                     let message = Message::<Secret>::raw(bytes);
 
                     debug!(
-                        "{}: Creating adaptor signature with funding script: {:?}",
+                        "{}: Creating adaptor signature for outcome '{}' with funding script: {:?}",
                         self.name,
+                        outcome.outcome,
                         hex::encode(funding_script.as_bytes())
                     );
                     debug!("{}: CET txid: {:?}", self.name, cet.compute_txid());
@@ -753,8 +772,9 @@ impl<B: Blockchain> DlcParty<B> {
                         hex::encode(bytes)
                     );
                     debug!(
-                        "{}: Oracle point: {:?}",
+                        "{}: Oracle signature point for outcome '{}': {:?}",
                         self.name,
+                        outcome.outcome,
                         oracle_point.to_string()
                     );
 
@@ -854,7 +874,7 @@ impl<B: Blockchain> DlcParty<B> {
     /// * `input_index` - The input index
     /// * `funding_output` - The funding output
     #[instrument(skip_all)]
-    async fn verify_adaptor_signatures(
+    fn verify_adaptor_signatures(
         &self,
         counterparty_script_pubkey: ScriptBuf,
         payout_script_pubkey: ScriptBuf,
@@ -875,27 +895,49 @@ impl<B: Blockchain> DlcParty<B> {
                 return Err(TaprootDlcError::NumericContract);
             }
         };
+
+        // For enumeration contracts, there should be only one nonce
+        if announcement.oracle_event.oracle_nonces.is_empty() {
+            error!("No oracle nonces found in announcement");
+            return Err(TaprootDlcError::InvalidAdaptorSignature);
+        }
+
+        let nonce = &announcement.oracle_event.oracle_nonces[0]; // Use the single nonce
+
         for (i, signature) in sigs.iter().enumerate() {
-            let nonce = announcement.oracle_event.oracle_nonces[i].clone();
-            let oracle_point = convert_xonly_to_normal_point(&nonce);
+            let outcome = &payouts[i];
+
+            // Create oracle signature point for this specific outcome
+            let outcome_hash = bitcoin::hashes::sha256::Hash::hash(outcome.outcome.as_bytes());
+            let outcome_message = secp256k1_zkp::Message::from_digest(outcome_hash.to_byte_array());
+
+            // Compute the oracle signature point for this outcome
+            let oracle_sig_point = dlc::secp_utils::schnorrsig_compute_sig_point(
+                &self.secp,
+                &announcement.oracle_public_key,
+                nonce,
+                &outcome_message,
+            )
+            .map_err(|e| {
+                error!("Failed to compute oracle signature point: {}", e);
+                TaprootDlcError::InvalidAdaptorSignature
+            })?;
+
+            let oracle_point =
+                Point::<Normal, Public, NonZero>::from_bytes(oracle_sig_point.serialize())
+                    .unwrap_or_else(|| {
+                        error!("Failed to convert oracle signature point");
+                        panic!("Failed to convert oracle signature point");
+                    });
 
             let cet = self.build_cet(
-                &payouts[i],
+                outcome,
                 counterparty_script_pubkey.clone(),
                 payout_script_pubkey.clone(),
                 funding_transaction,
             );
 
-            let sighash = create_sighash_msg(
-                &self.secp,
-                &self.keypair,
-                &cet,
-                funding_script,
-                input_index,
-                funding_output,
-                &self.blockchain,
-            )
-            .await;
+            let sighash = create_sighash_msg(&cet, funding_script, input_index, funding_output);
             let bytes = sighash.as_raw_hash().as_byte_array();
             let message = Message::<Secret>::raw(bytes);
 
@@ -908,8 +950,9 @@ impl<B: Blockchain> DlcParty<B> {
             };
 
             debug!(
-                "{}: Verifying with funding script: {:?}",
+                "{}: Verifying adaptor signature for outcome '{}' with funding script: {:?}",
                 self.name,
+                outcome.outcome,
                 hex::encode(funding_script.as_bytes())
             );
             debug!("{}: CET txid: {:?}", self.name, cet.compute_txid());
@@ -919,8 +962,9 @@ impl<B: Blockchain> DlcParty<B> {
                 hex::encode(bytes)
             );
             debug!(
-                "{}: Oracle point: {:?}",
+                "{}: Oracle signature point for outcome '{}': {:?}",
                 self.name,
+                outcome.outcome,
                 oracle_point.to_string()
             );
             debug!("{}: Verification key: {:?}", self.name, verify_key);
@@ -931,11 +975,17 @@ impl<B: Blockchain> DlcParty<B> {
                 message,
                 signature,
             ) {
-                error!("{}: Invalid adaptor signature", self.name);
+                error!(
+                    "{}: Invalid adaptor signature for outcome '{}'",
+                    self.name, outcome.outcome
+                );
                 return Err(TaprootDlcError::InvalidAdaptorSignature);
             }
         }
-        debug!("Successfully verified all adaptor signatures");
+        debug!(
+            "{}: Successfully verified all adaptor signatures",
+            self.name
+        );
         Ok(())
     }
 
@@ -976,13 +1026,13 @@ impl<B: Blockchain> DlcParty<B> {
             self.create_funding_script(&offer_params.fund_pubkey, &accept_params.fund_pubkey)?;
 
         // Calculate change outputs and fees for both parties
-        let (offer_change_output, offer_fund_fee, offer_cet_fee) = offer_params
+        let (offer_change_output, _offer_fund_fee, offer_cet_fee) = offer_params
             .get_change_output_and_fees(fee_rate_per_vb, Amount::ZERO)
             .map_err(|e| {
                 TaprootDlcError::General(format!("Failed to calculate offer fees: {}", e))
             })?;
 
-        let (accept_change_output, accept_fund_fee, accept_cet_fee) = accept_params
+        let (accept_change_output, _accept_fund_fee, accept_cet_fee) = accept_params
             .get_change_output_and_fees(fee_rate_per_vb, Amount::ZERO)
             .map_err(|e| {
                 TaprootDlcError::General(format!("Failed to calculate accept fees: {}", e))
@@ -1178,13 +1228,6 @@ fn convert_xonly_to_normal_point(x_only_pk: &XOnlyPublicKey) -> Point<Normal, Pu
     oracle_point.normalize()
 }
 
-/// Converts a schnorr_fun KeyPair to a secp256k1_zkp Keypair
-fn convert_keypair(keypair: &KeyPair<EvenY>, secp: &Secp256k1<All>) -> secp256k1_zkp::Keypair {
-    let secret_key =
-        secp256k1_zkp::SecretKey::from_slice(&keypair.secret_key().to_bytes()).unwrap();
-    secp256k1_zkp::Keypair::from_secret_key(&secp, &secret_key)
-}
-
 /// Creates a sighash message for a transaction
 ///
 /// # Arguments
@@ -1195,14 +1238,11 @@ fn convert_keypair(keypair: &KeyPair<EvenY>, secp: &Secp256k1<All>) -> secp256k1
 /// * `input_index` - The input index
 /// * `funding_output` - The funding output
 #[instrument(skip_all)]
-async fn create_sighash_msg<'a, B: Blockchain>(
-    secp: &Secp256k1<All>,
-    keypair: &'a KeyPair<EvenY>,
+fn create_sighash_msg<'a>(
     cet: &'a Transaction,
     funding_script: &'a Script,
     input_index: usize,
     funding_output: &'a TxOut,
-    blockchain: &'a B,
 ) -> TapSighash {
     debug!("Creating sighash message for transaction");
     let mut cache = SighashCache::new(cet.clone());
@@ -1322,14 +1362,14 @@ mod tests {
 
         let accept = bob.accept_dlc(offer).await.expect("Error accepting DLC");
 
-        let signed = alice.sign_dlc(accept).await.expect("Error signing DLC");
+        let signed = alice.sign_dlc(accept).expect("Error signing DLC");
 
         let funding_transaction = bob
             .verify_sign_and_broadcast(signed)
             .await
             .expect("Error verifying and broadcasting DLC");
 
-        let broadcast = client
+        client
             .send_raw_transaction(&funding_transaction)
             .expect("Error broadcasting DLC");
     }
