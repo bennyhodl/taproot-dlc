@@ -1,6 +1,7 @@
 //! Utility functions not uniquely related to DLC
 
 use bitcoin::sighash::SighashCache;
+use bitcoin::transaction::Version;
 use bitcoin::{sighash::EcdsaSighashType, Script, Transaction, TxOut};
 use bitcoin::{Amount, ScriptBuf, Sequence, Witness};
 use bitcoin::{PubkeyHash, WitnessProgram, WitnessVersion};
@@ -13,6 +14,45 @@ pub(crate) const DISABLE_LOCKTIME: Sequence = Sequence(0xffffffff);
 // Setting the nSequence for every input of a transaction to this value disables
 // RBF but enables nLockTime usage.
 pub(crate) const ENABLE_LOCKTIME: Sequence = Sequence(0xfffffffe);
+/// Minimum value that can be included in a transaction output. Under this value,
+/// outputs are discarded
+/// See: https://github.com/discreetlogcontracts/dlcspecs/blob/master/Transactions.md#change-outputs
+pub const DUST_LIMIT: Amount = Amount::from_sat(1000);
+
+/// The transaction version
+/// See: https://github.com/discreetlogcontracts/dlcspecs/blob/master/Transactions.md#funding-transaction
+pub const TX_VERSION: Version = Version::TWO;
+
+/// The base weight of a fund transaction
+/// See: https://github.com/discreetlogcontracts/dlcspecs/blob/master/Transactions.md#fees
+pub const FUND_TX_BASE_WEIGHT: usize = 230;
+
+/// The weight of a CET excluding payout outputs
+/// See: https://github.com/discreetlogcontracts/dlcspecs/blob/master/Transactions.md#fees
+pub const CET_BASE_WEIGHT: usize = 500;
+
+/// The base weight of a transaction input computed as: (outpoint(36) + sequence(4) + scriptPubKeySize(1)) * 4
+/// See: <https://github.com/discreetlogcontracts/dlcspecs/blob/master/Transactions.md#fees>
+pub const TX_INPUT_BASE_WEIGHT: usize = 164;
+
+/// The witness size of a P2WPKH input
+/// See: <https://github.com/discreetlogcontracts/dlcspecs/blob/master/Transactions.md#fees>
+pub const P2WPKH_WITNESS_SIZE: usize = 107;
+
+pub const TAPROOT_WITNESS_SIZE: usize = 230;
+
+#[macro_export]
+macro_rules! checked_add {
+    ($a: expr, $b: expr) => {
+        $a.checked_add($b).ok_or(dlc::Error::InvalidArgument)
+    };
+    ($a: expr, $b: expr, $c: expr) => {
+        checked_add!(checked_add!($a, $b)?, $c)
+    };
+    ($a: expr, $b: expr, $c: expr, $d: expr) => {
+        checked_add!(checked_add!($a, $b, $c)?, $d)
+    };
+}
 
 /// Get a BIP143 (https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki)
 /// signature hash with sighash all flag for a segwit transaction input as
@@ -102,7 +142,7 @@ pub fn weight_to_fee(weight: usize, fee_rate: u64) -> Result<Amount, Error> {
 
 /// Return the common base fee for a DLC for the given fee rate.
 pub fn get_common_fee(fee_rate: u64) -> Result<Amount, Error> {
-    let base_weight = crate::port::FUND_TX_BASE_WEIGHT + crate::port::CET_BASE_WEIGHT;
+    let base_weight = FUND_TX_BASE_WEIGHT + CET_BASE_WEIGHT;
     weight_to_fee(base_weight, fee_rate)
 }
 

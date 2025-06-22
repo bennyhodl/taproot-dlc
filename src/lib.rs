@@ -1,5 +1,4 @@
 #![allow(dead_code, unused)]
-mod port;
 mod util;
 pub mod wallet;
 
@@ -61,31 +60,12 @@ pub enum TaprootDlcError {
     Oracle,
 }
 
-// pub struct TxInputInfo {
-//     /// The outpoint for the utxo
-//     pub outpoint: OutPoint,
-//     /// The maximum witness length
-//     pub max_witness_len: usize,
-//     /// The redeem script
-//     pub redeem_script: ScriptBuf,
-//     /// The serial id for the input that will be used for ordering inputs of
-//     /// the fund transaction
-//     pub serial_id: u64,
-// }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 /// Contains information about a specific input to be used in a funding transaction,
 /// as well as its corresponding on-chain UTXO.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FundingInput {
     /// Serial id used for input ordering in the funding transaction.
     pub input_serial_id: u64,
-    // #[cfg_attr(
-    //     feature = "use-serde",
-    //     serde(
-    //         serialize_with = "crate::serde_utils::serialize_hex",
-    //         deserialize_with = "crate::serde_utils::deserialize_hex_string"
-    //     )
-    // )]
     /// The previous transaction used by the associated input in serialized format.
     pub prev_tx: Vec<u8>,
     /// The vout of the output used by the associated input.
@@ -146,9 +126,13 @@ pub struct PartyParams {
     change_serial_id: u64,
     // The serial id of the payout output
     payout_serial_id: u64,
+    // The collateral amount required for the contract
     collateral: Amount,
+    // The funding inputs for the contract
     funding_inputs: Vec<FundingInput>,
+    // The funding transaction info for the contract
     funding_tx_info: Vec<TxInputInfo>,
+    // The input amount for the contract
     input_amount: Amount,
 }
 
@@ -176,7 +160,7 @@ impl PartyParams {
 
             inputs_weight = crate::checked_add!(
                 inputs_weight,
-                crate::port::TX_INPUT_BASE_WEIGHT,
+                util::TX_INPUT_BASE_WEIGHT,
                 script_weight,
                 w.max_witness_len
             )?;
@@ -192,7 +176,7 @@ impl PartyParams {
 
         // Base weight (nLocktime, nVersion, ...) is distributed among parties
         // independently of inputs contributed
-        let this_party_fund_base_weight = crate::port::FUND_TX_BASE_WEIGHT / 2;
+        let this_party_fund_base_weight = util::FUND_TX_BASE_WEIGHT / 2;
 
         let total_fund_weight = checked_add!(
             this_party_fund_base_weight,
@@ -207,7 +191,7 @@ impl PartyParams {
 
         // Base weight (nLocktime, nVersion, funding input ...) is distributed
         // among parties independently of output types
-        let this_party_cet_base_weight = crate::port::CET_BASE_WEIGHT / 2;
+        let this_party_cet_base_weight = util::CET_BASE_WEIGHT / 2;
 
         // size of the payout script pubkey scaled by 4 from vBytes to weight units
         let output_spk_weight = self.payout_spk.len().checked_mul(4).ok_or_else(|| {
