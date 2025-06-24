@@ -27,6 +27,7 @@ bitcoincore-rpc = "0.19.0"
 bdk_esplora = "0.20.1"
 anyhow = "1.0.98"
 tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }
+# secp256k1-zkp = {path = "../../bitcoin/rust-secp256k1-zkp"}
 
 [[bin]]
 name = "taproot-dlc"

@@ -1,9 +1,12 @@
 //! Utility functions not uniquely related to DLC
 
-use bitcoin::{Amount, ScriptBuf, Sequence};
+use bitcoin::consensus::Decodable;
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction};
 use bitcoin::{Script, TxOut};
 use bitcoin::{WitnessProgram, WitnessVersion};
-use dlc::Error;
+use dlc::{Error, TxInputInfo};
+
+use crate::{FundingInput, TaprootDlcError};
 
 // Setting the nSequence for every input of a transaction to this value disables
 // both RBF and nLockTime usage.
@@ -27,7 +30,8 @@ pub const TX_INPUT_BASE_WEIGHT: usize = 164;
 #[macro_export]
 macro_rules! checked_add {
     ($a: expr, $b: expr) => {
-        $a.checked_add($b).ok_or(dlc::Error::InvalidArgument)
+        $a.checked_add($b)
+            .ok_or(TaprootDlcError::General("Checked add failed".to_string()))
     };
     ($a: expr, $b: expr, $c: expr) => {
         checked_add!(checked_add!($a, $b)?, $c)
@@ -81,4 +85,47 @@ pub(crate) fn get_sequence(lock_time: u32) -> Sequence {
     } else {
         ENABLE_LOCKTIME
     }
+}
+
+pub fn get_tx_input_infos(
+    funding_inputs: &[FundingInput],
+) -> Result<(Vec<TxInputInfo>, Amount), TaprootDlcError> {
+    let mut input_amount = Amount::ZERO;
+    let mut inputs = Vec::new();
+
+    for fund_input in funding_inputs {
+        let tx = Transaction::consensus_decode(&mut fund_input.prev_tx.as_slice())
+            .map_err(|e| TaprootDlcError::General(format!("Error decoding transaction: {}", e)))?;
+        let vout = fund_input.prev_tx_vout;
+        let tx_out = tx
+            .output
+            .get(vout as usize)
+            .ok_or(TaprootDlcError::General(
+                "Invalid previous transaction output".to_string(),
+            ))?;
+        input_amount += tx_out.value;
+        inputs.push(TxInputInfo {
+            outpoint: OutPoint {
+                txid: tx.compute_txid(),
+                vout,
+            },
+            max_witness_len: 65,
+            redeem_script: fund_input.redeem_script.clone(),
+            serial_id: fund_input.input_serial_id,
+        });
+    }
+
+    Ok((inputs, input_amount))
+}
+
+/// Get the vout and TxOut of the first output with a matching `script_pubkey`
+/// if any.
+pub fn get_output_for_script_pubkey<'a>(
+    tx: &'a Transaction,
+    script_pubkey: &Script,
+) -> Option<(usize, &'a TxOut)> {
+    tx.output
+        .iter()
+        .enumerate()
+        .find(|(_, x)| &x.script_pubkey == script_pubkey)
 }

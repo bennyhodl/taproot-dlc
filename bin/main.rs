@@ -6,7 +6,7 @@ use ddk_manager::contract::{
     ContractDescriptor,
 };
 use dlc::{EnumerationPayout, Payout};
-use kormir::{storage::MemoryStorage, Oracle, OracleAnnouncement, OracleAttestation};
+use kormir::{OracleAnnouncement, OracleAttestation};
 use taproot_dlc::{wallet::TaprootWallet, DlcParty, TaprootDlcError};
 use tracing::Level;
 use tracing_subscriber::fmt::Subscriber;
