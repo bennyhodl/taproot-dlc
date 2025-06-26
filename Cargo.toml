@@ -12,8 +12,8 @@ hex = "0.4.3"
 kormir = "0.4.1"
 lightning = "0.0.125"
 rand = "0.8.5"
-schnorr_fun = { version = "0.10.0", features = ["libsecp_compat"] }
-secp256k1-zkp = "0.11.0"
+# schnorr_fun = { version = "0.10.0", features = ["libsecp_compat"] }
+# secp256k1-zkp = "0.11.0"
 serde_json = "1.0.133"
 sha2 = "0.10.8"
 thiserror = "2.0.8"
@@ -27,6 +27,7 @@ bitcoincore-rpc = "0.19.0"
 bdk_esplora = "0.20.1"
 anyhow = "1.0.98"
 tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }
+secp256k1-zkp = {path = "../../bitcoin/rust-secp256k1-zkp"}
 
 [[bin]]
 name = "taproot-dlc"
